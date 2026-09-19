@@ -1,0 +1,11 @@
+# Python / Flask
+__pycache__/
+*.pyc
+backend/invites.db
+backend/config.json
+invites.db
+
+# Node / Vite
+frontend/node_modules/
+frontend/dist/
+.DS_Store

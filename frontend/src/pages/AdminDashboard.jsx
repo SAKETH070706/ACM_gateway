@@ -1,0 +1,1633 @@
+import React, { useState, useEffect } from 'react';
+import { api } from '../api/client';
+import {
+  Users, UploadCloud, Split, MessageSquare, Settings,
+  RefreshCw, Download, Trash2, Plus, Check, Search,
+  ExternalLink, Copy, Shield, AlertTriangle, ArrowRight, Layers,
+  ArrowRightLeft
+} from 'lucide-react';
+import Modal from '../components/Modal';
+import ProgressBar from '../components/ProgressBar';
+
+export default function AdminDashboard({ showToast }) {
+  const [activeTab, setActiveTab] = useState('matrix'); // 'matrix', 'upload', 'students', 'templates', 'settings'
+  const [overview, setOverview] = useState(null);
+  const [ebms, setEbms] = useState([]);
+  const [studentsData, setStudentsData] = useState({ students: [], total: 0, page: 1, total_pages: 1 });
+  const [templates, setTemplates] = useState([]);
+  const [config, setConfig] = useState({ whatsapp_group_link: '', base_url: '', admin_password: '' });
+  const [loading, setLoading] = useState(true);
+
+  // Student Filter & Search States
+  const [search, setSearch] = useState('');
+  const [filterEbm, setFilterEbm] = useState('');
+  const [filterContacted, setFilterContacted] = useState('');
+  const [filterJoined, setFilterJoined] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
+
+  // Modals & Forms
+  const [renewModal, setRenewModal] = useState({ open: false, student: null });
+  const [ebmModal, setEbmModal] = useState({ open: false, isEdit: false, data: { name: '', username: '', password: '', weight: 4 } });
+  const [templateModal, setTemplateModal] = useState({ open: false, isEdit: false, data: { title: '', content: '', is_default: false } });
+
+  // Manual Batch Adjustment / Transfer Modal
+  const [transferModal, setTransferModal] = useState({
+    open: false,
+    fromEbmId: '',
+    toEbmId: '',
+    mode: 'quick', // 'quick' or 'specific'
+    count: 1,
+    selectedStudentIds: [],
+    searchFilter: '',
+    loadingStudents: false,
+    sourceStudents: []
+  });
+
+  // Bulk Selection in Student Directory
+  const [selectedStudentIds, setSelectedStudentIds] = useState([]);
+  const [bulkTargetEbm, setBulkTargetEbm] = useState('');
+
+  // CSV Upload States
+  const [studentFile, setStudentFile] = useState(null);
+  const [uploadMode, setUploadMode] = useState('overwrite'); // 'overwrite' or 'sync'
+  const [ebmFile, setEbmFile] = useState(null);
+  const [uploading, setUploading] = useState(false);
+
+  useEffect(() => {
+    loadInitialData();
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'students') {
+      loadStudents();
+    }
+  }, [activeTab, search, filterEbm, filterContacted, filterJoined, currentPage]);
+
+  const loadInitialData = async () => {
+    setLoading(true);
+    try {
+      const [over, ebmRes, tplRes, cfgRes] = await Promise.all([
+        api.getOverview(),
+        api.getEbms(),
+        api.getTemplates(),
+        api.getConfig(),
+      ]);
+      setOverview(over);
+      setEbms(ebmRes.ebms || []);
+      setTemplates(tplRes.templates || []);
+      setConfig(cfgRes);
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadStudents = async () => {
+    try {
+      const params = {
+        page: currentPage,
+        limit: 25,
+        search,
+        ebm_id: filterEbm,
+        contacted: filterContacted,
+        joined: filterJoined
+      };
+      const res = await api.getStudents(params);
+      setStudentsData(res);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  // --- Actions: CSV Upload ---
+  const handleUploadStudents = async (e) => {
+    e.preventDefault();
+    if (!studentFile) return;
+
+    if (uploadMode === 'overwrite') {
+      const confirmed = window.confirm(
+        'OVERWRITE MODE SELECTED:\n\nThis will replace the student roster and issue fresh one-time links. Existing student records will be removed. Proceed?'
+      );
+      if (!confirmed) return;
+    }
+
+    setUploading(true);
+    const fd = new FormData();
+    fd.append('file', studentFile);
+    fd.append('mode', uploadMode);
+
+    try {
+      const res = await api.uploadStudentsCsv(fd);
+      showToast(res.message);
+      setStudentFile(null);
+      loadInitialData();
+      if (activeTab === 'students') loadStudents();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleUploadEbm = async (e) => {
+    e.preventDefault();
+    if (!ebmFile) return;
+    setUploading(true);
+    const fd = new FormData();
+    fd.append('file', ebmFile);
+    try {
+      const res = await api.uploadEbmCsv(fd);
+      showToast(res.message);
+      setEbmFile(null);
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // --- Actions: Batch Splitting ---
+  const handleSplitBatches = async (reassignAll = false) => {
+    const confirmMsg = reassignAll 
+      ? 'Are you sure you want to RE-SPLIT all students across EBMs based on weights?' 
+      : 'Split all unassigned students across EBMs?';
+    if (!window.confirm(confirmMsg)) return;
+
+    try {
+      const res = await api.splitBatches(reassignAll);
+      showToast(res.message);
+      loadInitialData();
+      if (activeTab === 'students') loadStudents();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  // --- Actions: Token Renewal ---
+  const handleRenewToken = async (action) => {
+    if (!renewModal.student) return;
+    try {
+      const res = await api.renewToken(renewModal.student.id, action);
+      showToast(res.message);
+      setRenewModal({ open: false, student: null });
+      loadStudents();
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  // --- Actions: EBM Save & Delete ---
+  const handleSaveEbm = async (e) => {
+    e.preventDefault();
+    try {
+      if (ebmModal.isEdit) {
+        await api.updateEbm(ebmModal.data.id, ebmModal.data);
+        showToast('EBM details updated');
+      } else {
+        await api.createEbm(ebmModal.data);
+        showToast('EBM member added');
+      }
+      setEbmModal({ open: false, isEdit: false, data: { name: '', username: '', password: '', weight: 4 } });
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  const handleDeleteEbm = async (id, name) => {
+    if (!window.confirm(`Delete EBM ${name}? Their assigned students will become unassigned.`)) return;
+    try {
+      await api.deleteEbm(id);
+      showToast('EBM deleted');
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  // --- Actions: Weight Quick Change ---
+  const handleQuickWeightChange = async (ebmId, newWeight) => {
+    if (newWeight < 1) return;
+    const targetEbm = ebms.find((e) => e.id === ebmId);
+    if (!targetEbm) return;
+    try {
+      await api.updateEbm(ebmId, { name: targetEbm.name, weight: newWeight });
+      setEbms((prev) => prev.map((e) => (e.id === ebmId ? { ...e, weight: newWeight } : e)));
+      showToast(`Weight for ${targetEbm.name} updated to ${newWeight}`);
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  // --- Actions: Transfer / Manual Batch Adjustment Modal ---
+  const handleOpenTransferModal = async (fromEbmId = '') => {
+    const defaultFrom = fromEbmId !== '' ? String(fromEbmId) : (ebms[0]?.id ? String(ebms[0].id) : 'unassigned');
+    const defaultTo = ebms.find((e) => String(e.id) !== String(defaultFrom))?.id 
+      ? String(ebms.find((e) => String(e.id) !== String(defaultFrom)).id) 
+      : 'unassigned';
+
+    setTransferModal({
+      open: true,
+      fromEbmId: defaultFrom,
+      toEbmId: defaultTo,
+      mode: 'quick',
+      count: 1,
+      selectedStudentIds: [],
+      searchFilter: '',
+      loadingStudents: true,
+      sourceStudents: []
+    });
+
+    try {
+      const res = await api.getStudents({ ebm_id: defaultFrom, limit: 300 });
+      setTransferModal((prev) => ({
+        ...prev,
+        loadingStudents: false,
+        sourceStudents: res.students || []
+      }));
+    } catch (err) {
+      setTransferModal((prev) => ({ ...prev, loadingStudents: false }));
+    }
+  };
+
+  const handleTransferSourceChange = async (newSourceId) => {
+    setTransferModal((prev) => ({
+      ...prev,
+      fromEbmId: newSourceId,
+      loadingStudents: true,
+      selectedStudentIds: [],
+      sourceStudents: []
+    }));
+    try {
+      const res = await api.getStudents({ ebm_id: newSourceId, limit: 300 });
+      setTransferModal((prev) => ({
+        ...prev,
+        loadingStudents: false,
+        sourceStudents: res.students || []
+      }));
+    } catch (err) {
+      setTransferModal((prev) => ({ ...prev, loadingStudents: false }));
+    }
+  };
+
+  const handleExecuteQuickTransfer = async () => {
+    try {
+      const res = await api.transferStudents({
+        from_ebm_id: transferModal.fromEbmId,
+        to_ebm_id: transferModal.toEbmId,
+        count: transferModal.count
+      });
+      showToast(res.message);
+      setTransferModal((prev) => ({ ...prev, open: false }));
+      loadInitialData();
+      if (activeTab === 'students') loadStudents();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  const handleExecuteSpecificTransfer = async () => {
+    if (transferModal.selectedStudentIds.length === 0) return;
+    try {
+      const res = await api.reassignStudents(transferModal.selectedStudentIds, transferModal.toEbmId);
+      showToast(res.message);
+      setTransferModal((prev) => ({ ...prev, open: false, selectedStudentIds: [] }));
+      loadInitialData();
+      if (activeTab === 'students') loadStudents();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  const handleToggleTransferStudentId = (studentId) => {
+    setTransferModal((prev) => ({
+      ...prev,
+      selectedStudentIds: prev.selectedStudentIds.includes(studentId)
+        ? prev.selectedStudentIds.filter((id) => id !== studentId)
+        : [...prev.selectedStudentIds, studentId]
+    }));
+  };
+
+  const handleSelectAllFilteredStudents = () => {
+    const ids = filteredSourceStudents.map((s) => s.id);
+    const allSelected = ids.length > 0 && ids.every((id) => transferModal.selectedStudentIds.includes(id));
+    setTransferModal((prev) => ({
+      ...prev,
+      selectedStudentIds: allSelected
+        ? prev.selectedStudentIds.filter((id) => !ids.includes(id))
+        : Array.from(new Set([...prev.selectedStudentIds, ...ids]))
+    }));
+  };
+
+  const getSourceStudentCount = () => {
+    if (transferModal.fromEbmId === 'unassigned' || !transferModal.fromEbmId) {
+      return overview?.stats?.unassigned_students || 0;
+    }
+    const source = ebms.find((e) => String(e.id) === String(transferModal.fromEbmId));
+    return source?.assigned_count || 0;
+  };
+
+  const filteredSourceStudents = transferModal.sourceStudents.filter((s) => {
+    if (!transferModal.searchFilter) return true;
+    const term = transferModal.searchFilter.toLowerCase();
+    return (
+      (s.name || '').toLowerCase().includes(term) ||
+      (s.phone || '').includes(term) ||
+      (s.acm_id || '').toLowerCase().includes(term)
+    );
+  });
+
+  // --- Actions: Inline & Bulk Student Assignment in Directory ---
+  const handleInlineStudentAssign = async (studentId, studentName, newEbmId) => {
+    try {
+      const res = await api.assignStudent(studentId, newEbmId);
+      showToast(`${studentName} reassigned to ${res.ebm_name}`);
+      setStudentsData((prev) => ({
+        ...prev,
+        students: prev.students.map((s) =>
+          s.id === studentId ? { ...s, ebm_id: res.ebm_id, ebm_name: res.ebm_name } : s
+        )
+      }));
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  const handleToggleSelectStudent = (studentId) => {
+    setSelectedStudentIds((prev) =>
+      prev.includes(studentId) ? prev.filter((id) => id !== studentId) : [...prev, studentId]
+    );
+  };
+
+  const handleToggleSelectAllCurrentPage = () => {
+    const pageStudentIds = studentsData.students.map((s) => s.id);
+    const allSelected = pageStudentIds.length > 0 && pageStudentIds.every((id) => selectedStudentIds.includes(id));
+    if (allSelected) {
+      setSelectedStudentIds((prev) => prev.filter((id) => !pageStudentIds.includes(id)));
+    } else {
+      setSelectedStudentIds((prev) => Array.from(new Set([...prev, ...pageStudentIds])));
+    }
+  };
+
+  const handleApplyBulkReassign = async () => {
+    if (selectedStudentIds.length === 0) return;
+    try {
+      const res = await api.reassignStudents(selectedStudentIds, bulkTargetEbm);
+      showToast(res.message);
+      setSelectedStudentIds([]);
+      loadInitialData();
+      loadStudents();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  // --- Actions: Template Save & Delete ---
+  const handleSaveTemplate = async (e) => {
+    e.preventDefault();
+    try {
+      if (templateModal.isEdit) {
+        await api.updateTemplate(templateModal.data.id, templateModal.data);
+        showToast('Template updated');
+      } else {
+        await api.createTemplate(templateModal.data);
+        showToast('Template created');
+      }
+      setTemplateModal({ open: false, isEdit: false, data: { title: '', content: '', is_default: false } });
+      const t = await api.getTemplates();
+      setTemplates(t.templates || []);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  const handleSetDefaultTemplate = async (id) => {
+    try {
+      await api.setDefaultTemplate(id);
+      showToast('Default template set');
+      const t = await api.getTemplates();
+      setTemplates(t.templates || []);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  const handleDeleteTemplate = async (id) => {
+    if (!window.confirm('Delete this message template?')) return;
+    try {
+      await api.deleteTemplate(id);
+      showToast('Template deleted');
+      const t = await api.getTemplates();
+      setTemplates(t.templates || []);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  // --- Actions: Gateway Config Save ---
+  const handleSaveConfig = async (e) => {
+    e.preventDefault();
+    try {
+      await api.saveConfig(config);
+      showToast('Gateway configuration saved successfully');
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  const copyToClipboard = (text) => {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text);
+      showToast('Link copied to clipboard!');
+    }
+  };
+
+  return (
+    <div className="app-container">
+      {/* Top Header */}
+      <div className="page-header">
+        <div className="page-title-group">
+          <h1>
+            <Shield size={26} color="var(--primary)" />
+            <span>Master Administration Dashboard</span>
+          </h1>
+          <p className="page-subtitle">
+            Dynamic CSV parsing, weighted batch allocation, token lifecycle controls, and live metrics
+          </p>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <a
+            href="/api/admin/export/links"
+            className="btn btn-secondary btn-sm"
+            download
+          >
+            <Download size={15} />
+            <span>Export CSV with Links</span>
+          </a>
+          <button
+            onClick={loadInitialData}
+            className="btn btn-secondary btn-sm"
+            title="Refresh statistics"
+          >
+            <RefreshCw size={15} />
+            <span>Refresh</span>
+          </button>
+        </div>
+      </div>
+
+      {/* KPI Stats Cards */}
+      {overview && (
+        <div className="stats-grid">
+          <div className="stat-card primary">
+            <span className="stat-label">Total Ingested Students</span>
+            <div className="stat-num">{overview.stats.total_students}</div>
+            <span className="stat-sub">{overview.stats.unassigned_students} unassigned</span>
+          </div>
+
+          <div className="stat-card blue">
+            <span className="stat-label">Students Contacted</span>
+            <div className="stat-num">{overview.stats.contacted_students}</div>
+            <ProgressBar value={overview.stats.contact_rate} color="primary" />
+            <span className="stat-sub">{overview.stats.contact_rate}% contacted by EBMs</span>
+          </div>
+
+          <div className="stat-card success">
+            <span className="stat-label">WhatsApp Group Joined</span>
+            <div className="stat-num">{overview.stats.joined_whatsapp}</div>
+            <ProgressBar value={overview.stats.join_rate} color="success" />
+            <span className="stat-sub">{overview.stats.join_rate}% single-use redeemed</span>
+          </div>
+
+          <div className="stat-card purple">
+            <span className="stat-label">Active EBM Team</span>
+            <div className="stat-num">{overview.stats.total_ebms}</div>
+            <span className="stat-sub">Configured dispatchers</span>
+          </div>
+        </div>
+      )}
+
+      {/* Navigation Tabs */}
+      <div className="tab-nav">
+        <button
+          className={`tab-btn ${activeTab === 'matrix' ? 'active' : ''}`}
+          onClick={() => setActiveTab('matrix')}
+        >
+          <Split size={16} />
+          <span>Batch Matrix & Team</span>
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'upload' ? 'active' : ''}`}
+          onClick={() => setActiveTab('upload')}
+        >
+          <UploadCloud size={16} />
+          <span>Dynamic CSV Uploads</span>
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'students' ? 'active' : ''}`}
+          onClick={() => setActiveTab('students')}
+        >
+          <Users size={16} />
+          <span>Student Directory & Tokens</span>
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'templates' ? 'active' : ''}`}
+          onClick={() => setActiveTab('templates')}
+        >
+          <MessageSquare size={16} />
+          <span>Message Templates</span>
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'settings' ? 'active' : ''}`}
+          onClick={() => setActiveTab('settings')}
+        >
+          <Settings size={16} />
+          <span>Gateway Settings</span>
+        </button>
+      </div>
+
+      {/* ================= TAB 1: BATCH MATRIX & TEAM ================= */}
+      {activeTab === 'matrix' && (
+        <div>
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: 16,
+            flexWrap: 'wrap',
+            gap: 12
+          }}>
+            <div>
+              <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--heading)' }}>EBM Team Allocation & Weightings</h2>
+              <p style={{ fontSize: 13, color: 'var(--muted)' }}>
+                Set customizable weightings (e.g. 6 for team leads, 4 for regular members) and auto-distribute students.
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button
+                onClick={() => handleOpenTransferModal('')}
+                className="btn btn-secondary"
+                title="Manually transfer or reallocate students between team members"
+              >
+                <ArrowRightLeft size={15} />
+                <span>Manual Student Adjustment</span>
+              </button>
+              <button
+                onClick={() => handleSplitBatches(false)}
+                className="btn btn-primary"
+              >
+                <Split size={15} />
+                <span>Auto-Split Unassigned</span>
+              </button>
+              <button
+                onClick={() => handleSplitBatches(true)}
+                className="btn btn-secondary"
+                title="Redistribute entire student list according to weights"
+              >
+                <span>Re-Split All</span>
+              </button>
+              <button
+                onClick={() => setEbmModal({ open: true, isEdit: false, data: { name: '', username: '', password: 'ebm123', weight: 4 } })}
+                className="btn btn-secondary"
+              >
+                <Plus size={15} />
+                <span>Add EBM</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="table-responsive">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ whiteSpace: 'nowrap' }}>EBM Name</th>
+                  <th style={{ whiteSpace: 'nowrap' }}>Username</th>
+                  <th style={{ textAlign: 'center', whiteSpace: 'nowrap', minWidth: 160 }}>Weight Ratio</th>
+                  <th style={{ textAlign: 'center', whiteSpace: 'nowrap', minWidth: 130 }}>Assigned Students</th>
+                  <th style={{ textAlign: 'center', whiteSpace: 'nowrap', minWidth: 80 }}>Contacted</th>
+                  <th style={{ textAlign: 'center', whiteSpace: 'nowrap', minWidth: 90 }}>Joined WhatsApp</th>
+                  <th style={{ minWidth: 130 }}>Progress</th>
+                  <th style={{ textAlign: 'right', whiteSpace: 'nowrap', minWidth: 230 }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ebms.length === 0 ? (
+                  <tr>
+                    <td colSpan="8" style={{ textAlign: 'center', padding: 32, color: 'var(--muted)' }}>
+                      No EBM members configured. Upload an EBM CSV or click "Add EBM".
+                    </td>
+                  </tr>
+                ) : (
+                  (() => {
+                    const totalWeights = ebms.reduce((acc, curr) => acc + (curr.weight || 4), 0);
+                    return ebms.map((e) => {
+                      const assigned = e.assigned_count || 0;
+                      const contacted = e.contacted_count || 0;
+                      const joined = e.joined_count || 0;
+                      const pct = assigned ? Math.round((contacted / assigned) * 100) : 0;
+                      const isLead = (e.weight || 4) >= 6;
+                      const weightPct = totalWeights > 0 ? Math.round(((e.weight || 4) / totalWeights) * 100) : 0;
+
+                      return (
+                        <tr key={e.id}>
+                          <td>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, whiteSpace: 'nowrap' }}>
+                              <strong style={{ color: 'var(--heading)' }}>{e.name}</strong>
+                              {isLead && <span className="badge badge-success" style={{ fontSize: 10 }}>Lead (x{e.weight})</span>}
+                            </div>
+                          </td>
+                          <td style={{ fontFamily: 'monospace', color: 'var(--primary)', fontWeight: 600, whiteSpace: 'nowrap' }}>{e.username}</td>
+                          <td style={{ textAlign: 'center' }}>
+                            <div style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              gap: 6,
+                              background: '#F8FAFC',
+                              padding: '3px 8px',
+                              borderRadius: 8,
+                              border: '1px solid var(--border)',
+                              whiteSpace: 'nowrap'
+                            }}>
+                              <button
+                                type="button"
+                                onClick={() => handleQuickWeightChange(e.id, Math.max(1, (e.weight || 4) - 1))}
+                                className="btn btn-secondary btn-sm"
+                                style={{ width: 24, height: 24, padding: 0, fontWeight: 700, fontSize: 13, lineHeight: '1' }}
+                                title="Decrease weighting"
+                                disabled={(e.weight || 4) <= 1}
+                              >
+                                -
+                              </button>
+                              <span style={{ minWidth: 46, fontWeight: 700, fontSize: 13, color: 'var(--heading)', textAlign: 'center' }}>
+                                x{e.weight || 4}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handleQuickWeightChange(e.id, (e.weight || 4) + 1)}
+                                className="btn btn-secondary btn-sm"
+                                style={{ width: 24, height: 24, padding: 0, fontWeight: 700, fontSize: 13, lineHeight: '1' }}
+                                title="Increase weighting"
+                              >
+                                +
+                              </button>
+                            </div>
+                            <div style={{ fontSize: 10, color: 'var(--muted)', marginTop: 2, whiteSpace: 'nowrap' }}>
+                              {weightPct}% of batch pool
+                            </div>
+                          </td>
+                          <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}><strong style={{ fontSize: 15, color: 'var(--heading)' }}>{assigned}</strong> students</td>
+                          <td style={{ textAlign: 'center' }}><span style={{ color: 'var(--success)', fontWeight: 700 }}>{contacted}</span></td>
+                          <td style={{ textAlign: 'center' }}><span style={{ color: 'var(--primary)', fontWeight: 700 }}>{joined}</span></td>
+                          <td style={{ width: 140 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <div style={{ flex: 1 }}>
+                                <ProgressBar value={pct} color="success" />
+                              </div>
+                              <span style={{ fontSize: 12, color: 'var(--muted)', fontWeight: 600 }}>{pct}%</span>
+                            </div>
+                          </td>
+                          <td>
+                            <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end', whiteSpace: 'nowrap' }}>
+                              <button
+                                onClick={() => handleOpenTransferModal(e.id)}
+                                className="btn btn-secondary btn-sm"
+                                title="Adjust or transfer students for this EBM"
+                              >
+                                <ArrowRightLeft size={13} />
+                                <span>Adjust</span>
+                              </button>
+                              <a
+                                href={`/ebm/${e.username}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="btn btn-secondary btn-sm"
+                                title="Open this EBM's Dispatcher View"
+                              >
+                                <ExternalLink size={13} />
+                                <span>View</span>
+                              </a>
+                              <button
+                                onClick={() => setEbmModal({ open: true, isEdit: true, data: e })}
+                                className="btn btn-secondary btn-sm"
+                              >
+                                Edit
+                              </button>
+                              <button
+                                onClick={() => handleDeleteEbm(e.id, e.name)}
+                                className="btn btn-danger btn-sm"
+                                title="Delete EBM"
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    });
+                  })()
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ================= TAB 2: DYNAMIC CSV UPLOADS ================= */}
+      {activeTab === 'upload' && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 24 }}>
+          {/* Student CSV Dropzone */}
+          <div className="card">
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8, color: 'var(--heading)' }}>
+              <Users size={20} color="var(--primary)" />
+              <span>Upload Student CSV</span>
+            </h2>
+            <p style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 20 }}>
+              Ingest any number of students without hardcoded limits. The backend automatically maps
+              Name, Mobile, ACM ID, Branch, and serializes any extra columns into JSON.
+            </p>
+
+            <form onSubmit={handleUploadStudents}>
+              {/* Overwrite vs Sync Radio Selection */}
+              <label style={{ fontSize: 13, fontWeight: 700, color: 'var(--heading)', marginBottom: 8 }}>
+                Upload Behavior &amp; Overwrite Mode:
+              </label>
+              <div className="radio-group">
+                <label className={`radio-option ${uploadMode === 'overwrite' ? 'selected' : ''}`}>
+                  <input
+                    type="radio"
+                    name="upload_mode"
+                    value="overwrite"
+                    checked={uploadMode === 'overwrite'}
+                    onChange={(e) => setUploadMode(e.target.value)}
+                  />
+                  <div>
+                    <strong style={{ display: 'block', fontSize: 13, color: 'var(--heading)' }}>
+                      Clean Overwrite (Replace All Students)
+                    </strong>
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                      Recommended for fresh campaigns. Replaces existing student records and generates brand-new single-use tokens.
+                    </span>
+                  </div>
+                </label>
+
+                <label className={`radio-option ${uploadMode === 'sync' ? 'selected' : ''}`}>
+                  <input
+                    type="radio"
+                    name="upload_mode"
+                    value="sync"
+                    checked={uploadMode === 'sync'}
+                    onChange={(e) => setUploadMode(e.target.value)}
+                  />
+                  <div>
+                    <strong style={{ display: 'block', fontSize: 13, color: 'var(--heading)' }}>
+                      Sync &amp; Update (Preserve Active Tokens)
+                    </strong>
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                      Matches existing students by ACM ID/Phone/Name and updates details while keeping already-claimed tokens and contact checkmarks intact.
+                    </span>
+                  </div>
+                </label>
+              </div>
+
+              <label
+                htmlFor="student-file-input"
+                className={`dropzone ${studentFile ? 'dragover' : ''}`}
+                style={{ marginBottom: 16 }}
+              >
+                <UploadCloud className="dropzone-icon" />
+                {studentFile ? (
+                  <div>
+                    <strong style={{ color: 'var(--primary)', display: 'block' }}>{studentFile.name}</strong>
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                      {(studentFile.size / 1024).toFixed(1)} KB — Click or drag to replace
+                    </span>
+                  </div>
+                ) : (
+                  <div>
+                    <span style={{ fontWeight: 600, display: 'block', color: 'var(--heading)' }}>Choose Student CSV or drop file here</span>
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>Supports any .csv file</span>
+                  </div>
+                )}
+                <input
+                  id="student-file-input"
+                  type="file"
+                  accept=".csv"
+                  style={{ display: 'none' }}
+                  onChange={(e) => setStudentFile(e.target.files[0])}
+                />
+              </label>
+
+              <button
+                type="submit"
+                className="btn btn-primary"
+                style={{ width: '100%' }}
+                disabled={!studentFile || uploading}
+              >
+                <UploadCloud size={16} />
+                <span>{uploading ? 'Processing CSV with Pandas...' : uploadMode === 'overwrite' ? 'Replace Roster & Generate Fresh Tokens' : 'Sync Student Roster'}</span>
+              </button>
+            </form>
+          </div>
+
+          {/* EBM Team CSV Dropzone */}
+          <div className="card">
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8, color: 'var(--heading)' }}>
+              <Split size={20} color="var(--primary)" />
+              <span>Upload EBM Team CSV (Seamless UPSERT)</span>
+            </h2>
+            <p style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 20 }}>
+              Bulk upload your team members with passwords and custom weightings (Columns: Name, Username, Password, Weight).
+              Uses UPSERT to update existing team members without errors. Leads (with "lead" in their name) auto-default to weight 6 if omitted.
+            </p>
+
+            <form onSubmit={handleUploadEbm}>
+              <label
+                htmlFor="ebm-file-input"
+                className={`dropzone ${ebmFile ? 'dragover' : ''}`}
+                style={{ marginBottom: 20 }}
+              >
+                <UploadCloud className="dropzone-icon" />
+                {ebmFile ? (
+                  <div>
+                    <strong style={{ color: 'var(--primary)', display: 'block' }}>{ebmFile.name}</strong>
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                      {(ebmFile.size / 1024).toFixed(1)} KB — Click or drag to replace
+                    </span>
+                  </div>
+                ) : (
+                  <div>
+                    <span style={{ fontWeight: 600, display: 'block', color: 'var(--heading)' }}>Choose EBM Team CSV or drop file here</span>
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>Supports .csv files</span>
+                  </div>
+                )}
+                <input
+                  id="ebm-file-input"
+                  type="file"
+                  accept=".csv"
+                  style={{ display: 'none' }}
+                  onChange={(e) => setEbmFile(e.target.files[0])}
+                />
+              </label>
+
+              <button
+                type="submit"
+                className="btn btn-primary"
+                style={{ width: '100%' }}
+                disabled={!ebmFile || uploading}
+              >
+                <UploadCloud size={16} />
+                <span>{uploading ? 'Upserting EBM Team...' : 'Upload & Sync EBM Team'}</span>
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ================= TAB 3: STUDENT DIRECTORY & TOKEN RENEWAL ================= */}
+      {activeTab === 'students' && (
+        <div>
+          <div style={{
+            display: 'flex',
+            gap: 12,
+            marginBottom: 16,
+            flexWrap: 'wrap',
+            alignItems: 'center'
+          }}>
+            {/* Search */}
+            <div className="search-wrapper">
+              <Search className="search-icon" size={16} />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => { setSearch(e.target.value); setCurrentPage(1); }}
+                placeholder="Search by student name, mobile, or ACM ID..."
+              />
+            </div>
+
+            {/* Filter by EBM */}
+            <select
+              value={filterEbm}
+              onChange={(e) => { setFilterEbm(e.target.value); setCurrentPage(1); }}
+              style={{ width: 180 }}
+            >
+              <option value="">All EBMs</option>
+              <option value="unassigned">Unassigned</option>
+              {ebms.map((e) => (
+                <option key={e.id} value={e.id}>{e.name}</option>
+              ))}
+            </select>
+
+            {/* Filter by Contacted */}
+            <select
+              value={filterContacted}
+              onChange={(e) => { setFilterContacted(e.target.value); setCurrentPage(1); }}
+              style={{ width: 160 }}
+            >
+              <option value="">Contacted: All</option>
+              <option value="1">Contacted</option>
+              <option value="0">Pending</option>
+            </select>
+
+            {/* Filter by Joined WhatsApp */}
+            <select
+              value={filterJoined}
+              onChange={(e) => { setFilterJoined(e.target.value); setCurrentPage(1); }}
+              style={{ width: 160 }}
+            >
+              <option value="">Token: All</option>
+              <option value="1">Redeemed / Joined</option>
+              <option value="0">Active / Unused</option>
+            </select>
+
+            <button
+              onClick={() => {
+                if (window.confirm('WARNING: Are you sure you want to delete ALL students and associated one-time links?')) {
+                  api.clearAllStudents().then((res) => {
+                    showToast(res.message);
+                    loadInitialData();
+                    loadStudents();
+                  });
+                }
+              }}
+              className="btn btn-danger btn-sm"
+            >
+              <Trash2 size={14} />
+              <span>Clear All</span>
+            </button>
+          </div>
+
+          <div className="table-responsive">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: 36, textAlign: 'center' }}>
+                    <input
+                      type="checkbox"
+                      checked={studentsData.students.length > 0 && studentsData.students.every((s) => selectedStudentIds.includes(s.id))}
+                      onChange={handleToggleSelectAllCurrentPage}
+                      title="Select / deselect all on page"
+                    />
+                  </th>
+                  <th>#</th>
+                  <th>Student Name</th>
+                  <th>Mobile Number</th>
+                  <th>ACM ID / Branch</th>
+                  <th style={{ minWidth: 170 }}>Assigned EBM</th>
+                  <th>One-Time Link Status</th>
+                  <th>Contact Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {studentsData.students.length === 0 ? (
+                  <tr>
+                    <td colSpan="9" style={{ textAlign: 'center', padding: 32, color: 'var(--muted)' }}>
+                      No students found matching your filters.
+                    </td>
+                  </tr>
+                ) : (
+                  studentsData.students.map((s, idx) => (
+                    <tr key={s.id}>
+                      <td style={{ textAlign: 'center' }}>
+                        <input
+                          type="checkbox"
+                          checked={selectedStudentIds.includes(s.id)}
+                          onChange={() => handleToggleSelectStudent(s.id)}
+                        />
+                      </td>
+                      <td>{(currentPage - 1) * studentsData.limit + idx + 1}</td>
+                      <td><strong style={{ color: 'var(--heading)' }}>{s.name}</strong></td>
+                      <td>{s.phone || '—'}</td>
+                      <td>
+                        <div>{s.acm_id || '—'}</div>
+                        <div style={{ fontSize: 11, color: 'var(--muted)' }}>{s.branch || ''}</div>
+                      </td>
+                      <td>
+                        <select
+                          value={s.ebm_id || ''}
+                          onChange={(e) => handleInlineStudentAssign(s.id, s.name, e.target.value)}
+                          style={{
+                            padding: '5px 8px',
+                            fontSize: 12,
+                            fontWeight: 600,
+                            borderRadius: 6,
+                            border: s.ebm_id ? '1px solid var(--border)' : '1px dashed var(--warning)',
+                            background: s.ebm_id ? '#F8FAFC' : '#FEF3C7',
+                            color: s.ebm_id ? 'var(--heading)' : '#B45309',
+                            cursor: 'pointer',
+                            width: '100%',
+                            maxWidth: 170
+                          }}
+                          title="Click to instantly reassign this student to another EBM"
+                        >
+                          <option value="">-- Unassigned --</option>
+                          {ebms.map((ebm) => (
+                            <option key={ebm.id} value={ebm.id}>
+                              {ebm.name} ({ebm.assigned_count || 0})
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        {s.is_used ? (
+                          <div>
+                            <span className="badge badge-danger">Redeemed</span>
+                            <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
+                              {s.used_at || ''}
+                            </div>
+                          </div>
+                        ) : (
+                          <span className="badge badge-success">Active Token</span>
+                        )}
+                      </td>
+                      <td>
+                        {s.is_contacted ? (
+                          <span className="badge badge-success">&#10003; Contacted</span>
+                        ) : (
+                          <span className="badge badge-neutral">Pending</span>
+                        )}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <button
+                            onClick={() => copyToClipboard(s.full_invite_link)}
+                            className="btn btn-secondary btn-sm"
+                            title="Copy single-use invite link"
+                          >
+                            <Copy size={13} />
+                          </button>
+                          <button
+                            onClick={() => setRenewModal({ open: true, student: s })}
+                            className="btn btn-secondary btn-sm"
+                            title="Reset or renew link for this student"
+                          >
+                            <RefreshCw size={13} />
+                            <span>Renew</span>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Floating Bulk Reassignment Bar */}
+          {selectedStudentIds.length > 0 && (
+            <div className="floating-bulk-bar">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <span style={{ fontWeight: 700, fontSize: 13, background: 'var(--primary)', color: '#FFFFFF', padding: '3px 10px', borderRadius: 20 }}>
+                  {selectedStudentIds.length} Selected
+                </span>
+                <span style={{ fontSize: 13, opacity: 0.9 }}>Reassign to:</span>
+                <select
+                  value={bulkTargetEbm}
+                  onChange={(e) => setBulkTargetEbm(e.target.value)}
+                  style={{
+                    width: 190,
+                    padding: '6px 10px',
+                    fontSize: 13,
+                    borderRadius: 6,
+                    background: '#0F172A',
+                    color: '#FFFFFF',
+                    border: '1px solid #334155'
+                  }}
+                >
+                  <option value="">-- Return to Unassigned Pool --</option>
+                  {ebms.map((ebm) => (
+                    <option key={ebm.id} value={ebm.id}>
+                      {ebm.name} ({ebm.assigned_count || 0})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={handleApplyBulkReassign}
+                  className="btn btn-primary btn-sm"
+                  style={{ padding: '6px 14px' }}
+                >
+                  <Check size={14} />
+                  <span>Apply Reassignment</span>
+                </button>
+              </div>
+              <button
+                onClick={() => setSelectedStudentIds([])}
+                className="btn btn-secondary btn-sm"
+                style={{ background: 'transparent', color: '#94A3B8', border: '1px solid #475569' }}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+
+          {/* Pagination Controls */}
+          {studentsData.total_pages > 1 && (
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginTop: 16,
+              fontSize: 13,
+              color: 'var(--muted)'
+            }}>
+              <div>Total: {studentsData.total} students</div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  disabled={currentPage <= 1}
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  className="btn btn-secondary btn-sm"
+                >
+                  Previous
+                </button>
+                <span style={{ alignSelf: 'center', padding: '0 8px', fontWeight: 600, color: 'var(--heading)' }}>
+                  Page {currentPage} of {studentsData.total_pages}
+                </span>
+                <button
+                  disabled={currentPage >= studentsData.total_pages}
+                  onClick={() => setCurrentPage((p) => Math.min(studentsData.total_pages, p + 1))}
+                  className="btn btn-secondary btn-sm"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ================= TAB 4: MESSAGE TEMPLATES ================= */}
+      {activeTab === 'templates' && (
+        <div>
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: 16,
+            flexWrap: 'wrap',
+            gap: 12
+          }}>
+            <div>
+              <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--heading)' }}>WhatsApp Message Templates</h2>
+              <p style={{ fontSize: 13, color: 'var(--muted)' }}>
+                Customize message formats with dynamic placeholders. Used by EBM dispatchers for WhatsApp group joining, goodies, or event invites.
+              </p>
+            </div>
+            <button
+              onClick={() => setTemplateModal({ open: true, isEdit: false, data: { title: '', content: '', is_default: false } })}
+              className="btn btn-primary"
+            >
+              <Plus size={15} />
+              <span>Create Template</span>
+            </button>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 20 }}>
+            {templates.map((tpl) => (
+              <div key={tpl.id} className="card" style={{ display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                  <h3 style={{ fontSize: 16, fontWeight: 700, color: 'var(--heading)' }}>{tpl.title}</h3>
+                  {tpl.is_default ? (
+                    <span className="badge badge-success">Active Default</span>
+                  ) : (
+                    <button
+                      onClick={() => handleSetDefaultTemplate(tpl.id)}
+                      className="btn btn-secondary btn-sm"
+                    >
+                      Make Default
+                    </button>
+                  )}
+                </div>
+
+                <pre style={{
+                  background: '#F8FAFC',
+                  border: '1px solid var(--border)',
+                  padding: 14,
+                  borderRadius: 'var(--radius)',
+                  fontSize: 13,
+                  color: 'var(--text)',
+                  whiteSpace: 'pre-wrap',
+                  fontFamily: 'inherit',
+                  flex: 1,
+                  marginBottom: 16
+                }}>
+                  {tpl.content}
+                </pre>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                    Placeholders: {'{name}, {link}, {acm_id}, {phone}'}
+                  </span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      onClick={() => setTemplateModal({ open: true, isEdit: true, data: tpl })}
+                      className="btn btn-secondary btn-sm"
+                    >
+                      Edit
+                    </button>
+                    {!tpl.is_default && (
+                      <button
+                        onClick={() => handleDeleteTemplate(tpl.id)}
+                        className="btn btn-danger btn-sm"
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ================= TAB 5: GATEWAY CONFIGURATION ================= */}
+      {activeTab === 'settings' && (
+        <div style={{ maxWidth: 600 }}>
+          <div className="card">
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16, color: 'var(--heading)' }}>Gateway &amp; Server Configuration</h2>
+            <form onSubmit={handleSaveConfig}>
+              <div className="form-group">
+                <label>Official WhatsApp Group Invite Link</label>
+                <input
+                  type="text"
+                  value={config.whatsapp_group_link || ''}
+                  onChange={(e) => setConfig({ ...config, whatsapp_group_link: e.target.value })}
+                  placeholder="https://chat.whatsapp.com/XXXXX"
+                  required
+                />
+                <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                  This secret destination link is revealed only during verified one-time redirections.
+                </span>
+              </div>
+
+              <div className="form-group">
+                <label>Base Server URL (Public Domain / Cloudflare URL)</label>
+                <input
+                  type="text"
+                  value={config.base_url || ''}
+                  onChange={(e) => setConfig({ ...config, base_url: e.target.value })}
+                  placeholder="https://your-domain.com"
+                  required
+                />
+                <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                  Used when generating student one-time links: e.g. {'https://your-domain.com/join/<token>'}
+                </span>
+              </div>
+
+              <div className="form-group">
+                <label>Change Master Admin Password</label>
+                <input
+                  type="password"
+                  value={config.admin_password || ''}
+                  onChange={(e) => setConfig({ ...config, admin_password: e.target.value })}
+                  placeholder="Enter new admin password"
+                />
+              </div>
+
+              <button type="submit" className="btn btn-primary" style={{ marginTop: 8 }}>
+                Save Configuration
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Renew Token */}
+      <Modal
+        isOpen={renewModal.open}
+        title="Renew / Reset Invite Token"
+        onClose={() => setRenewModal({ open: false, student: null })}
+      >
+        {renewModal.student && (
+          <div>
+            <p style={{ fontSize: 14, color: 'var(--text)', marginBottom: 16 }}>
+              Choose an action for <strong>{renewModal.student.name}</strong> ({renewModal.student.phone || 'No phone'}):
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <button
+                onClick={() => handleRenewToken('reset')}
+                className="btn btn-primary"
+                style={{ justifyContent: 'flex-start', padding: 14 }}
+              >
+                <div>
+                  <div style={{ fontWeight: 700 }}>Reset Existing Link (Keep Same URL)</div>
+                  <div style={{ fontSize: 12, opacity: 0.9, marginTop: 2 }}>
+                    Clears the device-bound lock and allows the recipient to open their existing URL again.
+                  </div>
+                </div>
+              </button>
+
+              <button
+                onClick={() => handleRenewToken('new_token')}
+                className="btn btn-secondary"
+                style={{ justifyContent: 'flex-start', padding: 14 }}
+              >
+                <div>
+                  <div style={{ fontWeight: 700 }}>Generate Brand New Cryptographic Token</div>
+                  <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>
+                    Invalidates the previous URL completely and issues a brand new invite link.
+                  </div>
+                </div>
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Modal: Add/Edit EBM */}
+      <Modal
+        isOpen={ebmModal.open}
+        title={ebmModal.isEdit ? 'Edit EBM Team Member' : 'Add New EBM Team Member'}
+        onClose={() => setEbmModal({ open: false, isEdit: false, data: {} })}
+      >
+        <form onSubmit={handleSaveEbm}>
+          <div className="form-group">
+            <label>Full Name</label>
+            <input
+              type="text"
+              value={ebmModal.data.name || ''}
+              onChange={(e) => setEbmModal({ ...ebmModal, data: { ...ebmModal.data, name: e.target.value } })}
+              placeholder="e.g. EBM Lead One"
+              required
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Username (Login ID)</label>
+            <input
+              type="text"
+              value={ebmModal.data.username || ''}
+              onChange={(e) => setEbmModal({ ...ebmModal, data: { ...ebmModal.data, username: e.target.value.toLowerCase() } })}
+              placeholder="e.g. ebm_lead_1"
+              disabled={ebmModal.isEdit}
+              required
+            />
+          </div>
+
+          <div className="form-group">
+            <label>{ebmModal.isEdit ? 'Change Password (Leave blank to keep current)' : 'Password'}</label>
+            <input
+              type="password"
+              value={ebmModal.data.password || ''}
+              onChange={(e) => setEbmModal({ ...ebmModal, data: { ...ebmModal.data, password: e.target.value } })}
+              placeholder={ebmModal.isEdit ? 'Keep unchanged' : 'Password'}
+              required={!ebmModal.isEdit}
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Allocation Weight (Higher ratio receives more students)</label>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              value={ebmModal.data.weight || 4}
+              onChange={(e) => setEbmModal({ ...ebmModal, data: { ...ebmModal.data, weight: parseInt(e.target.value) || 1 } })}
+              required
+            />
+            <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+              Example: Leads (weight 6), regular members (weight 4).
+            </span>
+          </div>
+
+          <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: 8 }}>
+            {ebmModal.isEdit ? 'Save Changes' : 'Create EBM Member'}
+          </button>
+        </form>
+      </Modal>
+
+      {/* Modal: Add/Edit Message Template */}
+      <Modal
+        isOpen={templateModal.open}
+        title={templateModal.isEdit ? 'Edit Message Template' : 'Create New Message Template'}
+        onClose={() => setTemplateModal({ open: false, isEdit: false, data: {} })}
+      >
+        <form onSubmit={handleSaveTemplate}>
+          <div className="form-group">
+            <label>Template Title</label>
+            <input
+              type="text"
+              value={templateModal.data.title || ''}
+              onChange={(e) => setTemplateModal({ ...templateModal, data: { ...templateModal.data, title: e.target.value } })}
+              placeholder="e.g. Official WhatsApp Group Invitation"
+              required
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Message Content</label>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
+              {['{name}', '{link}', '{acm_id}', '{phone}', '{branch}'].map((ph) => (
+                <button
+                  key={ph}
+                  type="button"
+                  onClick={() => {
+                    const cur = templateModal.data.content || '';
+                    setTemplateModal({
+                      ...templateModal,
+                      data: { ...templateModal.data, content: cur + (cur ? ' ' : '') + ph }
+                    });
+                  }}
+                  className="btn btn-secondary btn-sm"
+                  style={{ fontSize: 11 }}
+                >
+                  +{ph}
+                </button>
+              ))}
+            </div>
+
+            <textarea
+              rows="6"
+              value={templateModal.data.content || ''}
+              onChange={(e) => setTemplateModal({ ...templateModal, data: { ...templateModal.data, content: e.target.value } })}
+              placeholder="Hello {name}, here is your exclusive WhatsApp group link: {link}..."
+              required
+            />
+          </div>
+
+          <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: 8 }}>
+            {templateModal.isEdit ? 'Save Changes' : 'Create Template'}
+          </button>
+        </form>
+      </Modal>
+
+      {/* Modal: Manual Student Adjustment & Batch Transfer */}
+      <Modal
+        isOpen={transferModal.open}
+        title="Manual Student Adjustment & Batch Transfer"
+        onClose={() => setTransferModal({ ...transferModal, open: false })}
+      >
+        <div>
+          <p style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 16 }}>
+            Transfer students between team members or adjust allocations if an EBM or student is not comfortable.
+          </p>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+            <div>
+              <label style={{ fontSize: 12, fontWeight: 700 }}>Source (Transfer From):</label>
+              <select
+                value={transferModal.fromEbmId}
+                onChange={(e) => handleTransferSourceChange(e.target.value)}
+                style={{ fontSize: 13 }}
+              >
+                <option value="unassigned">Unassigned Pool ({overview?.stats?.unassigned_students || 0})</option>
+                {ebms.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name} ({e.assigned_count || 0} students)
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label style={{ fontSize: 12, fontWeight: 700 }}>Destination (Transfer To):</label>
+              <select
+                value={transferModal.toEbmId}
+                onChange={(e) => setTransferModal({ ...transferModal, toEbmId: e.target.value })}
+                style={{ fontSize: 13 }}
+              >
+                <option value="unassigned">Return to Unassigned Pool</option>
+                {ebms.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name} ({e.assigned_count || 0} students)
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Mode Switch Tabs */}
+          <div style={{ display: 'flex', gap: 8, marginBottom: 16, borderBottom: '1px solid var(--border)', paddingBottom: 8 }}>
+            <button
+              type="button"
+              className={`btn btn-sm ${transferModal.mode === 'quick' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setTransferModal({ ...transferModal, mode: 'quick' })}
+            >
+              Quick Count Transfer
+            </button>
+            <button
+              type="button"
+              className={`btn btn-sm ${transferModal.mode === 'specific' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setTransferModal({ ...transferModal, mode: 'specific' })}
+            >
+              Select Specific Students ({transferModal.sourceStudents.length})
+            </button>
+          </div>
+
+          {transferModal.mode === 'quick' ? (
+            <div>
+              <div className="form-group">
+                <label>Number of Students to Move (Max {getSourceStudentCount()}):</label>
+                <input
+                  type="number"
+                  min="1"
+                  max={getSourceStudentCount() || 1}
+                  value={transferModal.count}
+                  onChange={(e) => setTransferModal({ ...transferModal, count: parseInt(e.target.value) || 1 })}
+                />
+                <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                  Prioritizes uncontacted students first to avoid disrupting active outreach.
+                </span>
+              </div>
+
+              <button
+                type="button"
+                className="btn btn-primary"
+                style={{ width: '100%', marginTop: 8 }}
+                onClick={handleExecuteQuickTransfer}
+                disabled={getSourceStudentCount() === 0}
+              >
+                Transfer {transferModal.count} Student(s)
+              </button>
+            </div>
+          ) : (
+            <div>
+              <div style={{ marginBottom: 10, display: 'flex', gap: 8, alignItems: 'center' }}>
+                <div className="search-wrapper" style={{ flex: 1 }}>
+                  <Search className="search-icon" size={14} />
+                  <input
+                    type="text"
+                    placeholder="Search source students..."
+                    value={transferModal.searchFilter}
+                    onChange={(e) => setTransferModal({ ...transferModal, searchFilter: e.target.value })}
+                    style={{ padding: '6px 10px 6px 32px', fontSize: 12 }}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleSelectAllFilteredStudents}
+                >
+                  Toggle All
+                </button>
+              </div>
+
+              {transferModal.loadingStudents ? (
+                <div style={{ textAlign: 'center', padding: 24, color: 'var(--muted)', fontSize: 13 }}>
+                  Loading students...
+                </div>
+              ) : filteredSourceStudents.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: 24, color: 'var(--muted)', fontSize: 13 }}>
+                  No students found in this source.
+                </div>
+              ) : (
+                <div style={{ maxHeight: 220, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 8, padding: 8 }}>
+                  {filteredSourceStudents.map((s) => (
+                    <label
+                      key={s.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '6px 8px',
+                        borderBottom: '1px solid #F1F5F9',
+                        cursor: 'pointer',
+                        fontSize: 13,
+                        margin: 0
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <input
+                          type="checkbox"
+                          checked={transferModal.selectedStudentIds.includes(s.id)}
+                          onChange={() => handleToggleTransferStudentId(s.id)}
+                        />
+                        <div>
+                          <strong>{s.name}</strong>
+                          <span style={{ color: 'var(--muted)', marginLeft: 6, fontSize: 12 }}>{s.phone || ''}</span>
+                        </div>
+                      </div>
+                      {s.is_contacted ? (
+                        <span className="badge badge-success" style={{ fontSize: 10 }}>Contacted</span>
+                      ) : (
+                        <span className="badge badge-neutral" style={{ fontSize: 10 }}>Pending</span>
+                      )}
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              <button
+                type="button"
+                className="btn btn-primary"
+                style={{ width: '100%', marginTop: 12 }}
+                onClick={handleExecuteSpecificTransfer}
+                disabled={transferModal.selectedStudentIds.length === 0}
+              >
+                Transfer {transferModal.selectedStudentIds.length} Selected Student(s)
+              </button>
+            </div>
+          )}
+        </div>
+      </Modal>
+    </div>
+  );
+}
