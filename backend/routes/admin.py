@@ -27,7 +27,34 @@ def safe_object_id(id_val):
 def clean_phone_number(val):
     if val is None or pd.isna(val):
         return ""
-    digits = re.sub(r"\D", "", str(val))
+
+    if isinstance(val, float):
+        import math
+        if math.isnan(val):
+            return ""
+        val = int(val)
+
+    s = str(val).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+
+    # Remove all non-digit characters
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return ""
+
+    # Remove international dialing prefix 00
+    if digits.startswith("00"):
+        digits = digits[2:]
+
+    # If 11 digits starting with 0, remove trunk prefix 0
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+
+    # If it's a 10-digit Indian mobile number (starts with 6, 7, 8, 9), prepend '91'
+    if len(digits) == 10 and digits[0] in ["6", "7", "8", "9"]:
+        digits = f"91{digits}"
+
     return digits
 
 # ----------------- ADMIN OVERVIEW STATS -----------------

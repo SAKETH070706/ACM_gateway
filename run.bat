@@ -29,5 +29,5 @@ echo --------------------------------------------------------
 echo  Press Ctrl+C in this window to stop the server.
 echo ========================================================
 echo.
-python -m backend.app
+python -m uvicorn backend.main:app --host 0.0.0.0 --port 5000 --reload
 pause

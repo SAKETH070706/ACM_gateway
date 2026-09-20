@@ -4,11 +4,11 @@ import urllib.parse
 from datetime import datetime
 from bson import ObjectId
 from bson.errors import InvalidId
-from flask import Blueprint, request, jsonify, session
-from backend.config import load_config, get_db
-from backend.routes.auth import ebm_or_admin_required
+from fastapi import APIRouter, Request, HTTPException, status
+from backend.config import async_load_config, get_async_db
+from backend.routes.auth_api import require_ebm_or_admin
 
-ebm_bp = Blueprint("ebm", __name__)
+ebm_router = APIRouter(tags=["EBM Operations"])
 
 def safe_object_id(id_val):
     if id_val is None:
@@ -38,20 +38,16 @@ def clean_phone_number(val):
     if s.endswith(".0"):
         s = s[:-2]
 
-    # Remove all non-digit characters
     digits = re.sub(r"\D", "", s)
     if not digits:
         return ""
 
-    # Remove international dialing prefix 00
     if digits.startswith("00"):
         digits = digits[2:]
 
-    # If 11 digits starting with 0, remove trunk prefix 0
     if len(digits) == 11 and digits.startswith("0"):
         digits = digits[1:]
 
-    # If it's a 10-digit Indian mobile number (starts with 6, 7, 8, 9), prepend '91'
     if len(digits) == 10 and digits[0] in ["6", "7", "8", "9"]:
         digits = f"91{digits}"
 
@@ -79,51 +75,53 @@ def format_message(template_str, student_dict, base_url):
         msg = msg.replace(placeholder, str(v))
     return msg
 
-@ebm_bp.route("/api/ebm/dashboard", methods=["GET"])
-@ebm_or_admin_required
-def api_ebm_dashboard():
-    requested_username = request.args.get("username")
-    requested_id = request.args.get("ebm_id")
-
-    db = get_db()
+@ebm_router.get("/api/ebm/dashboard")
+async def api_ebm_dashboard(request: Request, username: str = None, ebm_id: str = None):
+    require_ebm_or_admin(request)
+    db = get_async_db()
     ebm_info = None
 
-    if session.get("admin_authenticated") and (requested_username or requested_id):
-        if requested_id:
-            oid = safe_object_id(requested_id)
-            ebm_info = db.ebms.find_one({"$or": [{"_id": oid}, {"id": requested_id}]})
+    if request.session.get("admin_authenticated") and (username or ebm_id):
+        if ebm_id:
+            oid = safe_object_id(ebm_id)
+            ebm_info = await db.ebms.find_one({"$or": [{"_id": oid}, {"id": ebm_id}]})
         else:
-            ebm_info = db.ebms.find_one({
+            ebm_info = await db.ebms.find_one({
                 "$or": [
-                    {"username": requested_username.lower()},
-                    {"name": {"$regex": f"^{re.escape(requested_username)}$", "$options": "i"}}
+                    {"username": username.lower()},
+                    {"name": {"$regex": f"^{re.escape(username)}$", "$options": "i"}}
                 ]
             })
-    elif session.get("ebm_user"):
-        session_id = session["ebm_user"]["id"]
+    elif request.session.get("ebm_user"):
+        session_id = request.session["ebm_user"]["id"]
         oid = safe_object_id(session_id)
-        ebm_info = db.ebms.find_one({"$or": [{"_id": oid}, {"id": session_id}]})
+        ebm_info = await db.ebms.find_one({"$or": [{"_id": oid}, {"id": session_id}]})
 
     if not ebm_info:
-        return jsonify({"error": "EBM profile not found"}), 404
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="EBM profile not found")
 
     ebm_id_str = str(ebm_info["_id"])
 
     # Fetch default template
-    tpl_row = db.message_templates.find_one({"is_default": 1})
+    tpl_row = await db.message_templates.find_one({"is_default": 1})
     if not tpl_row:
-        tpl_row = db.message_templates.find_one()
+        tpl_row = await db.message_templates.find_one()
     tpl_content = tpl_row["content"] if tpl_row else "Hello {name}, welcome to the ACM Student Chapter!\n\nJoin here: {link}"
 
-    cfg = load_config()
+    cfg = await async_load_config()
     base_url = cfg.get("base_url", "http://localhost:5000").rstrip("/")
 
     # Fetch students assigned to this EBM
-    student_docs = list(db.students.find({"assigned_ebm_id": ebm_id_str}).sort([("is_contacted", 1), ("_id", 1)]))
+    student_cursor = db.students.find({"assigned_ebm_id": ebm_id_str}).sort([("is_contacted", 1), ("_id", 1)])
+    student_docs = await student_cursor.to_list(length=5000)
 
     # Pre-fetch invite tokens to know redemption status
     tokens = [s.get("token") for s in student_docs if s.get("token")]
-    inv_map = {inv["token"]: inv for inv in db.invites.find({"token": {"$in": tokens}})} if tokens else {}
+    inv_map = {}
+    if tokens:
+        inv_cursor = db.invites.find({"token": {"$in": tokens}})
+        async for inv in inv_cursor:
+            inv_map[inv["token"]] = inv
 
     students = []
     contacted_count = 0
@@ -176,7 +174,7 @@ def api_ebm_dashboard():
     total_students = len(students)
     progress = round((contacted_count / total_students * 100) if total_students else 0, 1)
 
-    return jsonify({
+    return {
         "ebm": {
             "id": ebm_id_str,
             "name": ebm_info.get("name", "EBM Member"),
@@ -195,35 +193,38 @@ def api_ebm_dashboard():
             "content": tpl_content
         },
         "students": students
-    })
+    }
 
-@ebm_bp.route("/api/ebm/students/<student_id>/toggle-contact", methods=["POST"])
-@ebm_or_admin_required
-def api_toggle_student_contact(student_id):
+@ebm_router.post("/api/ebm/students/{student_id}/toggle-contact")
+async def api_toggle_student_contact(request: Request, student_id: str):
+    require_ebm_or_admin(request)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db = get_db()
+    db = get_async_db()
     oid = safe_object_id(student_id)
 
-    student = db.students.find_one({"$or": [{"_id": oid}, {"id": student_id}]})
+    student = await db.students.find_one({"$or": [{"_id": oid}, {"id": student_id}]})
     if not student:
-        return jsonify({"error": "Student not found"}), 404
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 
-    if not session.get("admin_authenticated"):
-        ebm_user = session.get("ebm_user")
+    if not request.session.get("admin_authenticated"):
+        ebm_user = request.session.get("ebm_user")
         if not ebm_user or str(ebm_user["id"]) != str(student.get("assigned_ebm_id")):
-            return jsonify({"error": "Forbidden: You are not assigned to this student"}), 403
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: You are not assigned to this student"
+            )
 
     current_status = student.get("is_contacted", 0)
     new_status = 0 if current_status else 1
     contacted_at = now_str if new_status == 1 else None
 
-    db.students.update_one(
+    await db.students.update_one(
         {"_id": student["_id"]},
         {"$set": {"is_contacted": new_status, "contacted_at": contacted_at}}
     )
 
-    return jsonify({
+    return {
         "success": True,
         "is_contacted": new_status,
         "contacted_at": contacted_at
-    })
+    }

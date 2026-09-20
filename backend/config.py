@@ -1,5 +1,6 @@
 import os
 from pymongo import MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
@@ -16,6 +17,8 @@ FRONTEND_DIST = os.path.join(PROJECT_ROOT, "frontend", "dist")
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
 _mongo_client = None
+_async_mongo_client = None
+_async_db = None
 
 def get_mongo_client():
     global _mongo_client
@@ -25,7 +28,6 @@ def get_mongo_client():
     return _mongo_client
 
 class MongoDatabaseWrapper:
-    """Wrapper that supports both direct collection access (db.students) and context manager (with get_db() as db)"""
     def __init__(self, db):
         self._db = db
 
@@ -51,6 +53,32 @@ def get_db():
         db = client["ACE_REG"]
     return MongoDatabaseWrapper(db)
 
+def init_async_db():
+    global _async_mongo_client, _async_db
+    uri = os.environ.get("MONGO_URI") or "mongodb://localhost:27017/acm_gateway"
+    _async_mongo_client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
+    try:
+        db = _async_mongo_client.get_default_database()
+        if db is None or db.name == "admin":
+            db = _async_mongo_client["ACE_REG"]
+    except Exception:
+        db = _async_mongo_client["ACE_REG"]
+    _async_db = db
+    return _async_db
+
+def close_async_db():
+    global _async_mongo_client, _async_db
+    if _async_mongo_client is not None:
+        _async_mongo_client.close()
+        _async_mongo_client = None
+        _async_db = None
+
+def get_async_db():
+    global _async_db
+    if _async_db is None:
+        return init_async_db()
+    return _async_db
+
 def load_config():
     cfg = {
         "whatsapp_group_link": os.environ.get("WHATSAPP_GROUP_LINK") or "https://chat.whatsapp.com/JvimDEP8FrQHOlicdDCEXX",
@@ -74,6 +102,29 @@ def load_config():
         cfg["admin_password"] = os.environ.get("ADMIN_PASSWORD").strip()
     return cfg
 
+async def async_load_config():
+    cfg = {
+        "whatsapp_group_link": os.environ.get("WHATSAPP_GROUP_LINK") or "https://chat.whatsapp.com/JvimDEP8FrQHOlicdDCEXX",
+        "base_url": os.environ.get("BASE_URL") or "https://wp-add-auto.onrender.com",
+        "admin_password": os.environ.get("ADMIN_PASSWORD") or "admin"
+    }
+    try:
+        db = get_async_db()
+        cursor = db.settings.find()
+        async for doc in cursor:
+            if "key" in doc and "value" in doc:
+                cfg[doc["key"]] = doc["value"]
+    except Exception as e:
+        print("Note on async loading config from MongoDB:", e)
+
+    if os.environ.get("WHATSAPP_GROUP_LINK"):
+        cfg["whatsapp_group_link"] = os.environ.get("WHATSAPP_GROUP_LINK").strip()
+    if os.environ.get("BASE_URL"):
+        cfg["base_url"] = os.environ.get("BASE_URL").strip().rstrip("/")
+    if os.environ.get("ADMIN_PASSWORD"):
+        cfg["admin_password"] = os.environ.get("ADMIN_PASSWORD").strip()
+    return cfg
+
 def save_config(cfg):
     try:
         db = get_db()
@@ -81,3 +132,11 @@ def save_config(cfg):
             db.settings.update_one({"key": k}, {"$set": {"key": k, "value": str(v)}}, upsert=True)
     except Exception as e:
         print("Note on saving config to MongoDB:", e)
+
+async def async_save_config(cfg):
+    try:
+        db = get_async_db()
+        for k, v in cfg.items():
+            await db.settings.update_one({"key": k}, {"$set": {"key": k, "value": str(v)}}, upsert=True)
+    except Exception as e:
+        print("Note on async saving config to MongoDB:", e)

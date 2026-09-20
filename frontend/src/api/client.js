@@ -101,6 +101,8 @@ export const api = {
   },
   getFilterOptions: () => apiRequest('/api/admin/filter-options'),
   syncRegistrations: (payload = {}) => apiRequest('/api/admin/sync/registrations', { method: 'POST', body: payload }),
+  updateStudent: (studentId, studentData) => apiRequest(`/api/admin/students/${studentId}`, { method: 'PUT', body: studentData }),
+  updateStudentStatus: (studentId, statusData) => apiRequest(`/api/admin/students/${studentId}/status`, { method: 'PATCH', body: statusData }),
   renewToken: (studentId, action = 'reset') => apiRequest(`/api/admin/tokens/renew/${studentId}`, { method: 'POST', body: { action } }),
   deleteStudent: (studentId) => apiRequest(`/api/admin/students/${studentId}`, { method: 'DELETE' }),
   clearAllStudents: () => apiRequest('/api/admin/students/clear-all', { method: 'POST' }),

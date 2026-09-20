@@ -4,7 +4,7 @@ import {
   Users, UploadCloud, Split, MessageSquare, Settings,
   RefreshCw, Download, Trash2, Plus, Check, Search,
   ExternalLink, Copy, Shield, AlertTriangle, ArrowRight, Layers,
-  ArrowRightLeft
+  ArrowRightLeft, Edit2
 } from 'lucide-react';
 import Modal from '../components/Modal';
 import ProgressBar from '../components/ProgressBar';
@@ -46,6 +46,7 @@ export default function AdminDashboard({ showToast }) {
   const [renewModal, setRenewModal] = useState({ open: false, student: null });
   const [ebmModal, setEbmModal] = useState({ open: false, isEdit: false, data: { name: '', username: '', password: '', weight: 4 } });
   const [templateModal, setTemplateModal] = useState({ open: false, isEdit: false, data: { title: '', content: '', is_default: false } });
+  const [editStudentModal, setEditStudentModal] = useState({ open: false, data: null, saving: false });
 
   // Manual Batch Adjustment / Transfer Modal
   const [transferModal, setTransferModal] = useState({
@@ -207,7 +208,6 @@ export default function AdminDashboard({ showToast }) {
     }
   };
 
-  // --- Actions: Batch Splitting ---
   const handleSplitBatches = async (reassignAll = false) => {
     const confirmMsg = reassignAll 
       ? 'Are you sure you want to RE-SPLIT all students across EBMs based on weights?' 
@@ -217,8 +217,7 @@ export default function AdminDashboard({ showToast }) {
     try {
       const res = await api.splitBatches(reassignAll);
       showToast(res.message);
-      loadInitialData();
-      if (activeTab === 'students') loadStudents();
+      await Promise.all([loadInitialData(), loadStudents()]);
     } catch (err) {
       showToast(err.message, 'error');
     }
@@ -443,6 +442,71 @@ export default function AdminDashboard({ showToast }) {
       loadStudents();
     } catch (err) {
       showToast(err.message, 'error');
+    }
+  };
+
+  // --- Student Admin CRUD Handlers ---
+  const handleToggleStudentStatus = async (studentId, currentContacted) => {
+    const newContacted = currentContacted ? 0 : 1;
+    // Optimistic UI update (0ms latency)
+    setStudentsData((prev) => ({
+      ...prev,
+      students: prev.students.map((s) =>
+        s.id === studentId ? { ...s, is_contacted: newContacted } : s
+      )
+    }));
+    try {
+      await api.updateStudentStatus(studentId, { is_contacted: newContacted });
+      showToast(newContacted ? 'Student marked as Contacted' : 'Student marked as Not Contacted');
+      loadInitialData(); // Refresh summary metrics
+    } catch (err) {
+      // Revert optimistic update on failure
+      setStudentsData((prev) => ({
+        ...prev,
+        students: prev.students.map((s) =>
+          s.id === studentId ? { ...s, is_contacted: currentContacted } : s
+        )
+      }));
+      showToast(err.message || 'Failed to update status', 'error');
+    }
+  };
+
+  const handleDeleteStudent = async (studentId, studentName) => {
+    if (!window.confirm(`Are you sure you want to permanently delete "${studentName}"?`)) {
+      return;
+    }
+    try {
+      await api.deleteStudent(studentId);
+      showToast('Student deleted successfully');
+      setStudentsData((prev) => ({
+        ...prev,
+        students: prev.students.filter((s) => s.id !== studentId),
+        total: Math.max(0, prev.total - 1)
+      }));
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message || 'Failed to delete student', 'error');
+    }
+  };
+
+  const handleSaveStudentEdit = async (e) => {
+    e.preventDefault();
+    if (!editStudentModal.data) return;
+    setEditStudentModal((prev) => ({ ...prev, saving: true }));
+    try {
+      await api.updateStudent(editStudentModal.data.id, editStudentModal.data);
+      showToast('Student details updated successfully');
+      setStudentsData((prev) => ({
+        ...prev,
+        students: prev.students.map((s) =>
+          s.id === editStudentModal.data.id ? { ...s, ...editStudentModal.data } : s
+        )
+      }));
+      setEditStudentModal({ open: false, data: null, saving: false });
+      loadInitialData();
+    } catch (err) {
+      showToast(err.message || 'Failed to save student details', 'error');
+      setEditStudentModal((prev) => ({ ...prev, saving: false }));
     }
   };
 
@@ -1222,7 +1286,7 @@ export default function AdminDashboard({ showToast }) {
                           onChange={() => handleToggleSelectStudent(s.id)}
                         />
                       </td>
-                      <td>{(currentPage - 1) * studentsData.limit + idx + 1}</td>
+                      <td>{(currentPage - 1) * (studentsData.limit || studentsData.per_page || 25) + idx + 1}</td>
                       <td>
                         <strong style={{ color: 'var(--heading)' }}>{s.name}</strong>
                         {s.email && <div style={{ fontSize: 11, color: 'var(--muted)' }}>{s.email}</div>}
@@ -1239,16 +1303,16 @@ export default function AdminDashboard({ showToast }) {
                       </td>
                       <td>
                         <select
-                          value={s.ebm_id || ''}
+                          value={s.ebm_id || s.assigned_ebm_id || ''}
                           onChange={(e) => handleInlineStudentAssign(s.id, s.name, e.target.value)}
                           style={{
                             padding: '5px 8px',
                             fontSize: 12,
                             fontWeight: 600,
                             borderRadius: 6,
-                            border: s.ebm_id ? '1px solid var(--border)' : '1px dashed var(--warning)',
-                            background: s.ebm_id ? '#F8FAFC' : '#FEF3C7',
-                            color: s.ebm_id ? 'var(--heading)' : '#B45309',
+                            border: (s.ebm_id || s.assigned_ebm_id) ? '1px solid var(--border)' : '1px dashed var(--warning)',
+                            background: (s.ebm_id || s.assigned_ebm_id) ? '#F8FAFC' : '#FEF3C7',
+                            color: (s.ebm_id || s.assigned_ebm_id) ? 'var(--heading)' : '#B45309',
                             cursor: 'pointer',
                             width: '100%',
                             maxWidth: 170
@@ -1276,16 +1340,35 @@ export default function AdminDashboard({ showToast }) {
                         )}
                       </td>
                       <td>
-                        {s.is_contacted ? (
-                          <span className="badge badge-success">&#10003; Contacted</span>
-                        ) : (
-                          <span className="badge badge-neutral">Pending</span>
-                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleToggleStudentStatus(s.id, s.is_contacted)}
+                          className={`badge ${s.is_contacted ? 'badge-success' : 'badge-neutral'}`}
+                          style={{
+                            cursor: 'pointer',
+                            border: 'none',
+                            padding: '4px 10px',
+                            fontWeight: 600,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 4
+                          }}
+                          title="Click to toggle status (Contacted / Not Contacted)"
+                        >
+                          {s.is_contacted ? '✓ Contacted' : '○ Not Contacted'}
+                        </button>
                       </td>
                       <td>
                         <div style={{ display: 'flex', gap: 6 }}>
                           <button
-                            onClick={() => copyToClipboard(s.full_invite_link)}
+                            onClick={() => setEditStudentModal({ open: true, data: { ...s }, saving: false })}
+                            className="btn btn-secondary btn-sm"
+                            title="Edit student information"
+                          >
+                            <Edit2 size={13} />
+                          </button>
+                          <button
+                            onClick={() => copyToClipboard(s.full_invite_link || s.invite_link)}
                             className="btn btn-secondary btn-sm"
                             title="Copy single-use invite link"
                           >
@@ -1297,7 +1380,14 @@ export default function AdminDashboard({ showToast }) {
                             title="Reset or renew link for this student"
                           >
                             <RefreshCw size={13} />
-                            <span>Renew</span>
+                          </button>
+                          <button
+                            onClick={() => handleDeleteStudent(s.id, s.name)}
+                            className="btn btn-secondary btn-sm"
+                            style={{ color: '#EF4444' }}
+                            title="Delete student record"
+                          >
+                            <Trash2 size={13} />
                           </button>
                         </div>
                       </td>
@@ -1945,6 +2035,165 @@ export default function AdminDashboard({ showToast }) {
             </div>
           </div>
         </form>
+      </Modal>
+
+      {/* Modal: Edit Student Record */}
+      <Modal
+        isOpen={editStudentModal.open}
+        maxWidth="600px"
+        title="Edit Student Information"
+        onClose={() => setEditStudentModal({ open: false, data: null, saving: false })}
+      >
+        {editStudentModal.data && (
+          <form onSubmit={handleSaveStudentEdit}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
+              <div className="form-group">
+                <label style={{ fontSize: 13, fontWeight: 600 }}>Full Name</label>
+                <input
+                  type="text"
+                  value={editStudentModal.data.name || ''}
+                  onChange={(e) => setEditStudentModal({
+                    ...editStudentModal,
+                    data: { ...editStudentModal.data, name: e.target.value }
+                  })}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label style={{ fontSize: 13, fontWeight: 600 }}>Mobile Number (WhatsApp)</label>
+                <input
+                  type="text"
+                  value={editStudentModal.data.phone || ''}
+                  onChange={(e) => setEditStudentModal({
+                    ...editStudentModal,
+                    data: { ...editStudentModal.data, phone: e.target.value }
+                  })}
+                  placeholder="e.g. 9876543210"
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label style={{ fontSize: 13, fontWeight: 600 }}>ACM ID / Confirmation</label>
+                <input
+                  type="text"
+                  value={editStudentModal.data.acm_id || ''}
+                  onChange={(e) => setEditStudentModal({
+                    ...editStudentModal,
+                    data: { ...editStudentModal.data, acm_id: e.target.value }
+                  })}
+                />
+              </div>
+
+              <div className="form-group">
+                <label style={{ fontSize: 13, fontWeight: 600 }}>Branch</label>
+                <input
+                  type="text"
+                  value={editStudentModal.data.branch || ''}
+                  onChange={(e) => setEditStudentModal({
+                    ...editStudentModal,
+                    data: { ...editStudentModal.data, branch: e.target.value }
+                  })}
+                  placeholder="e.g. IT, CSE, ECE"
+                />
+              </div>
+
+              <div className="form-group">
+                <label style={{ fontSize: 13, fontWeight: 600 }}>Academic Year</label>
+                <select
+                  value={editStudentModal.data.year || '1'}
+                  onChange={(e) => setEditStudentModal({
+                    ...editStudentModal,
+                    data: { ...editStudentModal.data, year: e.target.value }
+                  })}
+                >
+                  <option value="1">1st Year</option>
+                  <option value="2">2nd Year</option>
+                  <option value="3">3rd Year</option>
+                  <option value="4">4th Year</option>
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label style={{ fontSize: 13, fontWeight: 600 }}>Goodies Status</label>
+                <select
+                  value={editStudentModal.data.goodies || 'Yes'}
+                  onChange={(e) => setEditStudentModal({
+                    ...editStudentModal,
+                    data: { ...editStudentModal.data, goodies: e.target.value }
+                  })}
+                >
+                  <option value="Yes">Yes (Eligible)</option>
+                  <option value="No">No (Not Eligible)</option>
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label style={{ fontSize: 13, fontWeight: 600 }}>Section</label>
+                <input
+                  type="text"
+                  value={editStudentModal.data.section || ''}
+                  onChange={(e) => setEditStudentModal({
+                    ...editStudentModal,
+                    data: { ...editStudentModal.data, section: e.target.value }
+                  })}
+                  placeholder="e.g. A, B, C"
+                />
+              </div>
+
+              <div className="form-group">
+                <label style={{ fontSize: 13, fontWeight: 600 }}>Domain</label>
+                <input
+                  type="text"
+                  value={editStudentModal.data.domain || ''}
+                  onChange={(e) => setEditStudentModal({
+                    ...editStudentModal,
+                    data: { ...editStudentModal.data, domain: e.target.value }
+                  })}
+                  placeholder="e.g. Web Dev, AI/ML"
+                />
+              </div>
+            </div>
+
+            <div className="form-group" style={{ marginTop: 14 }}>
+              <label style={{ fontSize: 13, fontWeight: 600 }}>Assigned EBM Member</label>
+              <select
+                value={editStudentModal.data.assigned_ebm_id || ''}
+                onChange={(e) => setEditStudentModal({
+                  ...editStudentModal,
+                  data: { ...editStudentModal.data, assigned_ebm_id: e.target.value }
+                })}
+              >
+                <option value="">-- Unassigned --</option>
+                {ebms.map((ebm) => (
+                  <option key={ebm.id} value={ebm.id}>
+                    {ebm.name} ({ebm.assigned_count || 0})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div style={{ display: 'flex', gap: 10, marginTop: 24 }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ flex: 1 }}
+                onClick={() => setEditStudentModal({ open: false, data: null, saving: false })}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="btn btn-primary"
+                style={{ flex: 1 }}
+                disabled={editStudentModal.saving}
+              >
+                {editStudentModal.saving ? 'Saving...' : 'Save Student Changes'}
+              </button>
+            </div>
+          </form>
+        )}
       </Modal>
 
       {/* Modal: Manual Student Adjustment & Batch Transfer */}

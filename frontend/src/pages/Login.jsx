@@ -245,7 +245,7 @@ export default function Login({ onLoginSuccess }) {
                 <option value="">-- Choose your registered name --</option>
                 {ebmList.map((item) => (
                   <option key={item.id} value={item.name}>
-                    {item.name}
+                    {item.name}{item.weight && item.weight >= 6 ? ' (Team Lead)' : ''}
                   </option>
                 ))}
               </select>
