@@ -759,7 +759,7 @@ export default function AdminDashboard({ showToast }) {
             <div>
               <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--heading)' }}>EBM Team Allocation & Weightings</h2>
               <p style={{ fontSize: 13, color: 'var(--muted)' }}>
-                Set customizable weightings (e.g. 6 for team leads, 4 for regular members) and auto-distribute students.
+                Set customizable weightings (e.g. 6 for coordinators / CO-ORD, 4 for regular members) and auto-distribute students.
               </p>
             </div>
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
@@ -824,7 +824,7 @@ export default function AdminDashboard({ showToast }) {
                       const contacted = e.contacted_count || 0;
                       const joined = e.joined_count || 0;
                       const pct = assigned ? Math.round((contacted / assigned) * 100) : 0;
-                      const isLead = (e.weight || 4) >= 6;
+                      const isCoord = (e.weight || 4) >= 6;
                       const weightPct = totalWeights > 0 ? Math.round(((e.weight || 4) / totalWeights) * 100) : 0;
 
                       return (
@@ -832,7 +832,7 @@ export default function AdminDashboard({ showToast }) {
                           <td>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8, whiteSpace: 'nowrap' }}>
                               <strong style={{ color: 'var(--heading)' }}>{e.name}</strong>
-                              {isLead && <span className="badge badge-success" style={{ fontSize: 10 }}>Lead (x{e.weight})</span>}
+                              {isCoord && <span className="badge badge-success" style={{ fontSize: 10 }}>CO-ORD (x{e.weight})</span>}
                             </div>
                           </td>
                           <td style={{ fontFamily: 'monospace', color: 'var(--primary)', fontWeight: 600, whiteSpace: 'nowrap' }}>{e.username}</td>
@@ -1071,7 +1071,7 @@ export default function AdminDashboard({ showToast }) {
             </h2>
             <p style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 20 }}>
               Bulk upload your team members with passwords and custom weightings (Columns: Name, Username, Password, Weight).
-              Uses UPSERT to update existing team members without errors. Leads (with "lead" in their name) auto-default to weight 6 if omitted.
+              Uses UPSERT to update existing team members without errors. Coordinators (with "coord" or weight 6) auto-default to weight 6 if omitted.
             </p>
 
             <form onSubmit={handleUploadEbm}>
@@ -1712,7 +1712,7 @@ export default function AdminDashboard({ showToast }) {
               required
             />
             <span style={{ fontSize: 11, color: 'var(--muted)' }}>
-              Example: Leads (weight 6), regular members (weight 4).
+              Example: Coordinators / CO-ORD (weight 6), regular members (weight 4).
             </span>
           </div>
 
