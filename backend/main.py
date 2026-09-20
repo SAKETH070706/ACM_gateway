@@ -119,6 +119,10 @@ async def serve_index():
         status_code=status.HTTP_200_OK
     )
 
+@app.get("/healthz")
+async def health_check():
+    return {"status": "healthy"}
+
 @app.get("/{full_path:path}")
 async def serve_spa(full_path: str):
     # If request is intended for an API or join route that doesn't exist, return 404 JSON
