@@ -19,6 +19,8 @@ is_prod = bool(
 
 if is_prod:
     missing_vars = []
+    if not os.environ.get("MONGO_URI"):
+        missing_vars.append("MONGO_URI")
     if not os.environ.get("ADMIN_PASSWORD"):
         missing_vars.append("ADMIN_PASSWORD")
     if not os.environ.get("FLASK_SECRET_KEY"):

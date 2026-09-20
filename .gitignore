@@ -9,3 +9,9 @@ invites.db
 frontend/node_modules/
 frontend/dist/
 .DS_Store
+
+# Secrets & Environment Variables
+.env
+*.env
+backend/.env
+frontend/.env.local

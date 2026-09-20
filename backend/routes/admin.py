@@ -4,14 +4,25 @@ from datetime import datetime
 import io
 import csv
 import re
-import sqlite3
 import pandas as pd
+from bson import ObjectId
+from bson.errors import InvalidId
 from flask import Blueprint, request, jsonify, Response
+from pymongo import UpdateOne
 from werkzeug.security import generate_password_hash
 from backend.config import load_config, save_config, get_db
 from backend.routes.auth import admin_required
 
 admin_bp = Blueprint("admin", __name__)
+
+def safe_object_id(id_val):
+    """Safely converts string or int to ObjectId or returns original if invalid"""
+    if id_val is None:
+        return None
+    try:
+        return ObjectId(str(id_val))
+    except (InvalidId, TypeError):
+        return id_val
 
 def clean_phone_number(val):
     if val is None or pd.isna(val):
@@ -19,43 +30,48 @@ def clean_phone_number(val):
     digits = re.sub(r"\D", "", str(val))
     return digits
 
+# ----------------- ADMIN OVERVIEW STATS -----------------
 @admin_bp.route("/api/admin/overview", methods=["GET"])
 @admin_required
 def api_admin_overview():
     cfg = load_config()
-    with get_db() as conn:
-        cursor = conn.cursor()
+    db = get_db()
 
-        # Students stats
-        cursor.execute("SELECT COUNT(*) FROM students")
-        total_students = cursor.fetchone()[0]
+    total_students = db.students.count_documents({})
+    contacted_students = db.students.count_documents({"is_contacted": 1})
+    total_invites = db.invites.count_documents({})
+    used_invites = db.invites.count_documents({"is_used": 1})
+    unassigned_students = db.students.count_documents({
+        "$or": [{"assigned_ebm_id": None}, {"assigned_ebm_id": ""}]
+    })
 
-        cursor.execute("SELECT COUNT(*) FROM students WHERE is_contacted = 1")
-        contacted_students = cursor.fetchone()[0]
+    # Aggregate EBM team members
+    ebm_docs = list(db.ebms.find().sort([("weight", -1), ("name", 1)]))
+    ebm_summary = []
 
-        # Invites stats
-        cursor.execute("SELECT COUNT(*) FROM invites")
-        total_invites = cursor.fetchone()[0]
+    for e in ebm_docs:
+        e_id_str = str(e["_id"])
+        assigned_count = db.students.count_documents({"assigned_ebm_id": e_id_str})
+        contacted_count = db.students.count_documents({"assigned_ebm_id": e_id_str, "is_contacted": 1})
 
-        cursor.execute("SELECT COUNT(*) FROM invites WHERE is_used = 1")
-        used_invites = cursor.fetchone()[0]
+        # Count joined
+        student_tokens = [
+            s["token"] for s in db.students.find(
+                {"assigned_ebm_id": e_id_str, "token": {"$ne": None}},
+                {"token": 1}
+            ) if s.get("token")
+        ]
+        joined_count = db.invites.count_documents({"token": {"$in": student_tokens}, "is_used": 1}) if student_tokens else 0
 
-        # EBM stats
-        cursor.execute("""
-            SELECT e.id, e.name, e.username, e.weight,
-                   COUNT(s.id) as assigned_count,
-                   SUM(CASE WHEN s.is_contacted = 1 THEN 1 ELSE 0 END) as contacted_count,
-                   SUM(CASE WHEN i.is_used = 1 THEN 1 ELSE 0 END) as joined_count
-            FROM ebm_members e
-            LEFT JOIN students s ON s.assigned_ebm_id = e.id
-            LEFT JOIN invites i ON s.token = i.token
-            GROUP BY e.id
-            ORDER BY e.weight DESC, e.name ASC
-        """)
-        ebm_summary = [dict(r) for r in cursor.fetchall()]
-
-        cursor.execute("SELECT COUNT(*) FROM students WHERE assigned_ebm_id IS NULL OR assigned_ebm_id = ''")
-        unassigned_students = cursor.fetchone()[0]
+        ebm_summary.append({
+            "id": e_id_str,
+            "name": e.get("name", "EBM Member"),
+            "username": e.get("username", e.get("name")),
+            "weight": e.get("weight", 4),
+            "assigned_count": assigned_count,
+            "contacted_count": contacted_count,
+            "joined_count": joined_count
+        })
 
     return jsonify({
         "stats": {
@@ -75,8 +91,7 @@ def api_admin_overview():
         }
     })
 
-# ----------------- DYNAMIC CSV INGESTION (PANDAS) -----------------
-
+# ----------------- CSV INGESTION & DATA INTAKE -----------------
 def read_csv_dataframe(file):
     """
     Safely parse CSV bytes prioritizing utf-8-sig, cp1252, latin-1, utf-8,
@@ -132,7 +147,7 @@ def api_upload_students():
     if df.empty:
         return jsonify({"error": "Uploaded CSV file is empty"}), 400
 
-    # Flexible case-insensitive column matching
+    # Flexible column matching
     col_map = {}
     for col in df.columns:
         norm = col.strip().lower().replace("_", " ").replace("-", " ")
@@ -144,6 +159,10 @@ def api_upload_students():
             col_map["acm_id"] = col
         elif norm in ["branch", "department", "dept", "stream", "course"] and "branch" not in col_map:
             col_map["branch"] = col
+        elif norm in ["year", "academic year", "class", "batch year"] and "year" not in col_map:
+            col_map["year"] = col
+        elif norm in ["goodies", "goody", "swag", "kit", "goodies eligible", "goodie eligible"] and "goodies" not in col_map:
+            col_map["goodies"] = col
 
     if "name" not in col_map:
         col_map["name"] = df.columns[0]
@@ -151,8 +170,13 @@ def api_upload_students():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     upload_mode = request.form.get("mode", "overwrite").strip().lower()
 
+    # Conditional Token Generation Toggle (true by default)
+    raw_gen = request.form.get("generate_tokens")
+    generate_tokens = True if raw_gen is None or str(raw_gen).lower() in ["true", "1", "yes"] else False
+
+    db = get_db()
+
     if upload_mode == "overwrite":
-        # Prepare all data in memory FIRST so failures never delete existing data
         students_to_insert = []
         invites_to_insert = []
 
@@ -162,221 +186,411 @@ def api_upload_students():
             phone_val = clean_phone_number(phone_raw)
             acm_id_val = str(row[col_map["acm_id"]]).strip() if "acm_id" in col_map and pd.notna(row[col_map["acm_id"]]) else ""
             branch_val = str(row[col_map["branch"]]).strip() if "branch" in col_map and pd.notna(row[col_map["branch"]]) else ""
+            year_val = str(row[col_map["year"]]).strip() if "year" in col_map and pd.notna(row[col_map["year"]]) else "1"
+            goodies_val = str(row[col_map["goodies"]]).strip() if "goodies" in col_map and pd.notna(row[col_map["goodies"]]) else "Yes"
 
             extra_dict = {}
             for c in df.columns:
                 if c not in col_map.values() and pd.notna(row[c]):
                     extra_dict[c] = str(row[c]).strip()
-            extra_json = json.dumps(extra_dict) if extra_dict else None
 
-            token = secrets.token_urlsafe(12)
-            students_to_insert.append((name_val, phone_val, acm_id_val, branch_val, extra_json, token, 0, None, now_str))
-            invites_to_insert.append((token, name_val, 0, None, None, now_str))
+            token = secrets.token_urlsafe(12) if generate_tokens else None
 
-        with get_db() as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute("DELETE FROM invites WHERE student_id IS NOT NULL")
-                cursor.execute("DELETE FROM students")
+            s_doc = {
+                "name": name_val,
+                "phone": phone_val,
+                "acm_id": acm_id_val,
+                "branch": branch_val,
+                "year": year_val,
+                "goodies": goodies_val,
+                "extra_data": extra_dict,
+                "assigned_ebm_id": None,
+                "token": token,
+                "is_contacted": 0,
+                "contacted_at": None,
+                "created_at": now_str
+            }
+            students_to_insert.append(s_doc)
 
-                for s, inv in zip(students_to_insert, invites_to_insert):
-                    cursor.execute("""
-                        INSERT INTO students (name, phone, acm_id, branch, extra_data, token, is_contacted, contacted_at, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, s)
-                    student_id = cursor.lastrowid
-                    cursor.execute("""
-                        INSERT INTO invites (token, assigned_to, student_id, is_used, used_at, ip_address, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (inv[0], inv[1], student_id, inv[2], inv[3], inv[4], inv[5]))
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                return jsonify({"error": f"Database transaction failed during overwrite: {str(e)}"}), 500
+            if token:
+                invites_to_insert.append({
+                    "token": token,
+                    "assigned_to": name_val,
+                    "student_id": None,
+                    "is_used": 0,
+                    "used_at": None,
+                    "ip_address": None,
+                    "device_id": None,
+                    "created_at": now_str
+                })
+
+        try:
+            db.students.delete_many({})
+            db.invites.delete_many({})
+
+            if students_to_insert:
+                res = db.students.insert_many(students_to_insert)
+                if generate_tokens and invites_to_insert:
+                    for inv, s_id in zip(invites_to_insert, res.inserted_ids):
+                        inv["student_id"] = str(s_id)
+                    db.invites.insert_many(invites_to_insert)
+
+        except Exception as e:
+            return jsonify({"error": f"MongoDB operation failed during overwrite: {str(e)}"}), 500
 
         return jsonify({
             "success": True,
-            "message": f"Successfully replaced student roster: {len(students_to_insert)} fresh students ingested with new secure tokens.",
+            "message": f"Successfully ingested {len(students_to_insert)} students into MongoDB (Tokens Generated: {'Yes' if generate_tokens else 'No'}).",
             "count": len(students_to_insert),
             "mode": "overwrite",
+            "tokens_generated": generate_tokens,
             "detected_columns": list(col_map.keys())
         })
 
     else:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            try:
-                updated_count = 0
-                inserted_count = 0
+        # Sync mode
+        updated_count = 0
+        inserted_count = 0
 
-                for _, row in df.iterrows():
-                    name_val = str(row[col_map["name"]]).strip() if pd.notna(row[col_map["name"]]) else "Student"
-                    phone_raw = row[col_map["phone"]] if "phone" in col_map and pd.notna(row[col_map["phone"]]) else ""
-                    phone_val = clean_phone_number(phone_raw)
-                    acm_id_val = str(row[col_map["acm_id"]]).strip() if "acm_id" in col_map and pd.notna(row[col_map["acm_id"]]) else ""
-                    branch_val = str(row[col_map["branch"]]).strip() if "branch" in col_map and pd.notna(row[col_map["branch"]]) else ""
+        for _, row in df.iterrows():
+            name_val = str(row[col_map["name"]]).strip() if pd.notna(row[col_map["name"]]) else "Student"
+            phone_raw = row[col_map["phone"]] if "phone" in col_map and pd.notna(row[col_map["phone"]]) else ""
+            phone_val = clean_phone_number(phone_raw)
+            acm_id_val = str(row[col_map["acm_id"]]).strip() if "acm_id" in col_map and pd.notna(row[col_map["acm_id"]]) else ""
+            branch_val = str(row[col_map["branch"]]).strip() if "branch" in col_map and pd.notna(row[col_map["branch"]]) else ""
+            year_val = str(row[col_map["year"]]).strip() if "year" in col_map and pd.notna(row[col_map["year"]]) else "1"
+            goodies_val = str(row[col_map["goodies"]]).strip() if "goodies" in col_map and pd.notna(row[col_map["goodies"]]) else "Yes"
 
-                    extra_dict = {}
-                    for c in df.columns:
-                        if c not in col_map.values() and pd.notna(row[c]):
-                            extra_dict[c] = str(row[c]).strip()
-                    extra_json = json.dumps(extra_dict) if extra_dict else None
+            extra_dict = {}
+            for c in df.columns:
+                if c not in col_map.values() and pd.notna(row[c]):
+                    extra_dict[c] = str(row[c]).strip()
 
-                    existing = None
-                    if acm_id_val:
-                        cursor.execute("SELECT * FROM students WHERE LOWER(acm_id) = ?", (acm_id_val.lower(),))
-                        existing = cursor.fetchone()
-                    if not existing and phone_val:
-                        cursor.execute("SELECT * FROM students WHERE phone = ?", (phone_val,))
-                        existing = cursor.fetchone()
-                    if not existing and name_val:
-                        cursor.execute("SELECT * FROM students WHERE LOWER(name) = ?", (name_val.lower(),))
-                        existing = cursor.fetchone()
+            query = {}
+            if acm_id_val:
+                query = {"acm_id": {"$regex": f"^{re.escape(acm_id_val)}$", "$options": "i"}}
+            elif phone_val:
+                query = {"phone": phone_val}
+            elif name_val:
+                query = {"name": {"$regex": f"^{re.escape(name_val)}$", "$options": "i"}}
 
-                    if existing:
-                        cursor.execute("""
-                            UPDATE students
-                            SET name = ?, phone = ?, acm_id = ?, branch = ?, extra_data = ?
-                            WHERE id = ?
-                        """, (name_val, phone_val, acm_id_val, branch_val, extra_json, existing["id"]))
-                        if existing["token"]:
-                            cursor.execute("UPDATE invites SET assigned_to = ? WHERE token = ?", (name_val, existing["token"]))
-                        updated_count += 1
-                    else:
-                        token = secrets.token_urlsafe(12)
-                        cursor.execute("""
-                            INSERT INTO students (name, phone, acm_id, branch, extra_data, token, is_contacted, contacted_at, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)
-                        """, (name_val, phone_val, acm_id_val, branch_val, extra_json, token, now_str))
-                        student_id = cursor.lastrowid
-                        cursor.execute("""
-                            INSERT INTO invites (token, assigned_to, student_id, is_used, used_at, ip_address, created_at)
-                            VALUES (?, ?, ?, 0, NULL, NULL, ?)
-                        """, (token, name_val, student_id, now_str))
-                        inserted_count += 1
+            existing = db.students.find_one(query) if query else None
 
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                return jsonify({"error": f"Database transaction failed during sync: {str(e)}"}), 500
+            if existing:
+                update_fields = {
+                    "name": name_val,
+                    "phone": phone_val,
+                    "acm_id": acm_id_val,
+                    "branch": branch_val,
+                    "year": year_val,
+                    "goodies": goodies_val,
+                    "extra_data": extra_dict
+                }
+                # If generate_tokens is requested and student lacks a token, issue one
+                if generate_tokens and not existing.get("token"):
+                    new_token = secrets.token_urlsafe(12)
+                    update_fields["token"] = new_token
+                    db.invites.insert_one({
+                        "token": new_token,
+                        "assigned_to": name_val,
+                        "student_id": str(existing["_id"]),
+                        "is_used": 0,
+                        "used_at": None,
+                        "ip_address": None,
+                        "device_id": None,
+                        "created_at": now_str
+                    })
+                db.students.update_one({"_id": existing["_id"]}, {"$set": update_fields})
+                updated_count += 1
+            else:
+                new_token = secrets.token_urlsafe(12) if generate_tokens else None
+                s_doc = {
+                    "name": name_val,
+                    "phone": phone_val,
+                    "acm_id": acm_id_val,
+                    "branch": branch_val,
+                    "year": year_val,
+                    "goodies": goodies_val,
+                    "extra_data": extra_dict,
+                    "assigned_ebm_id": None,
+                    "token": new_token,
+                    "is_contacted": 0,
+                    "contacted_at": None,
+                    "created_at": now_str
+                }
+                s_res = db.students.insert_one(s_doc)
+                if new_token:
+                    db.invites.insert_one({
+                        "token": new_token,
+                        "assigned_to": name_val,
+                        "student_id": str(s_res.inserted_id),
+                        "is_used": 0,
+                        "used_at": None,
+                        "ip_address": None,
+                        "device_id": None,
+                        "created_at": now_str
+                    })
+                inserted_count += 1
 
         return jsonify({
             "success": True,
-            "message": f"Sync complete: {updated_count} students updated, {inserted_count} new students added.",
+            "message": f"Sync complete: {updated_count} students updated, {inserted_count} new students added to MongoDB.",
             "count": updated_count + inserted_count,
             "mode": "sync",
+            "tokens_generated": generate_tokens,
             "detected_columns": list(col_map.keys())
         })
 
-@admin_bp.route("/api/admin/upload/ebm", methods=["POST"])
+# ----------------- LIVE ACM MONGODB SYNC (registrations collection) -----------------
+@admin_bp.route("/api/admin/sync/registrations", methods=["POST"])
 @admin_required
-def api_upload_ebm():
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-    file = request.files["file"]
-    if not file or not file.filename.endswith(".csv"):
-        return jsonify({"error": "Please upload a valid .csv file"}), 400
+def api_sync_from_registrations():
+    data = request.get_json(silent=True) or {}
+    year_filter = str(data.get("year", "all")).strip()
+    goodies_filter = str(data.get("goodies", "all")).strip()
+    raw_gen = data.get("generate_tokens")
+    generate_tokens = True if raw_gen is None or str(raw_gen).lower() in ["true", "1", "yes"] else False
+    mode = str(data.get("mode", "sync")).strip().lower()  # "sync" or "overwrite"
 
-    try:
-        df = read_csv_dataframe(file)
-    except Exception as e:
-        return jsonify({"error": f"Failed to parse CSV: {str(e)}"}), 400
+    db = get_db()
 
-    col_map = {}
-    for col in df.columns:
-        norm = col.strip().lower().replace("_", " ")
-        if norm in ["name", "ebm name", "member name", "team member"] and "name" not in col_map:
-            col_map["name"] = col
-        elif norm in ["username", "user", "login id", "login"] and "username" not in col_map:
-            col_map["username"] = col
-        elif norm in ["password", "pass", "pin", "credential"] and "password" not in col_map:
-            col_map["password"] = col
-        elif norm in ["weight", "weighting", "quota", "ratio"] and "weight" not in col_map:
-            col_map["weight"] = col
+    query = {}
+    if year_filter and year_filter.lower() not in ["all", "any"]:
+        query["year"] = {"$regex": f"^{re.escape(year_filter)}", "$options": "i"}
+    if goodies_filter and goodies_filter.lower() not in ["all", "any"]:
+        if goodies_filter.lower() in ["yes", "true", "eligible"]:
+            query["goodies"] = {"$in": ["Yes", "yes", "YES", True]}
+        elif goodies_filter.lower() in ["no", "false", "not eligible"]:
+            query["goodies"] = {"$in": ["No", "no", "NO", False, None]}
 
-    if "name" not in col_map:
-        col_map["name"] = df.columns[0]
+    reg_docs = list(db.registrations.find(query))
+    if not reg_docs:
+        return jsonify({"error": "No registrations found in database matching specified criteria."}), 404
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ebm_to_upsert = []
 
-    for _, row in df.iterrows():
-        name_val = str(row[col_map["name"]]).strip() if pd.notna(row[col_map["name"]]) else "EBM Member"
-        if not name_val or name_val.lower() == "nan":
-            continue
+    if mode == "overwrite":
+        db.students.delete_many({})
+        db.invites.delete_many({})
+        students_to_insert = []
+        invites_to_insert = []
 
-        if "username" in col_map and pd.notna(row[col_map["username"]]):
-            username_val = str(row[col_map["username"]]).strip().lower()
-        else:
-            username_val = re.sub(r"[^a-zA-Z0-9]", "", name_val.lower().split()[0])
-            if not username_val:
-                username_val = f"ebm{secrets.token_hex(2)}"
+        for r in reg_docs:
+            token = secrets.token_urlsafe(12) if generate_tokens else None
+            s_doc = {
+                "name": r.get("name") or "Student",
+                "phone": clean_phone_number(r.get("phone")),
+                "email": r.get("email", ""),
+                "acm_id": r.get("aceId") or "",
+                "branch": r.get("branch", ""),
+                "year": r.get("year", "1st Year"),
+                "goodies": r.get("goodies", "Yes"),
+                "gender": r.get("gender", ""),
+                "registration_id": str(r["_id"]),
+                "extra_data": {
+                    "email": r.get("email", ""),
+                    "gender": r.get("gender", ""),
+                    "mode": r.get("mode", ""),
+                    "registrationType": r.get("registrationType", ""),
+                    "payment": r.get("payment", "")
+                },
+                "assigned_ebm_id": None,
+                "token": token,
+                "is_contacted": 0,
+                "contacted_at": None,
+                "created_at": now_str
+            }
+            students_to_insert.append(s_doc)
+            if token:
+                invites_to_insert.append({
+                    "token": token,
+                    "assigned_to": r.get("name") or "Student",
+                    "student_id": None,
+                    "is_used": 0,
+                    "used_at": None,
+                    "ip_address": None,
+                    "device_id": None,
+                    "created_at": now_str
+                })
 
-        if "password" in col_map and pd.notna(row[col_map["password"]]):
-            password_val = str(row[col_map["password"]]).strip()
-        else:
-            password_val = "ebm123"
+        res = db.students.insert_many(students_to_insert)
+        if generate_tokens and invites_to_insert:
+            for inv, s_id in zip(invites_to_insert, res.inserted_ids):
+                inv["student_id"] = str(s_id)
+            db.invites.insert_many(invites_to_insert)
 
-        if "weight" in col_map and pd.notna(row[col_map["weight"]]):
-            try:
-                weight_val = int(row[col_map["weight"]])
-            except ValueError:
-                weight_val = 4
-        else:
-            if any(lead in name_val.lower() for lead in ["lead", "head", "admin", "coordinator"]):
-                weight_val = 6
+        return jsonify({
+            "success": True,
+            "message": f"Successfully imported {len(students_to_insert)} student(s) directly from ACE_REG registrations (Overwrite Mode).",
+            "imported_count": len(students_to_insert),
+            "tokens_generated": generate_tokens
+        })
+
+    else:
+        # Sync mode: High-performance bulk upsert
+        existing_cursor = list(db.students.find({}, {"_id": 1, "registration_id": 1, "acm_id": 1, "phone": 1, "token": 1}))
+        existing_by_reg = {str(s["registration_id"]): s for s in existing_cursor if s.get("registration_id")}
+        existing_by_acm = {str(s["acm_id"]).strip().upper(): s for s in existing_cursor if s.get("acm_id")}
+        existing_by_phone = {str(s["phone"]).strip(): s for s in existing_cursor if s.get("phone")}
+
+        students_to_insert = []
+        invites_for_new = []
+        update_operations = []
+        invites_for_updated = []
+
+        for r in reg_docs:
+            ace_id = (r.get("aceId") or "").strip()
+            phone = clean_phone_number(r.get("phone"))
+            reg_id = str(r["_id"])
+
+            existing = (
+                existing_by_reg.get(reg_id) or
+                (existing_by_acm.get(ace_id.upper()) if ace_id else None) or
+                (existing_by_phone.get(phone) if phone else None)
+            )
+
+            if existing:
+                update_fields = {
+                    "name": r.get("name") or "Student",
+                    "email": r.get("email", ""),
+                    "phone": phone,
+                    "acm_id": ace_id,
+                    "branch": r.get("branch", ""),
+                    "year": r.get("year", "1st Year"),
+                    "goodies": r.get("goodies", "Yes"),
+                    "gender": r.get("gender", ""),
+                    "registration_id": reg_id
+                }
+                if generate_tokens and not existing.get("token"):
+                    new_tok = secrets.token_urlsafe(12)
+                    update_fields["token"] = new_tok
+                    existing["token"] = new_tok
+                    invites_for_updated.append({
+                        "token": new_tok,
+                        "assigned_to": r.get("name") or "Student",
+                        "student_id": str(existing["_id"]),
+                        "is_used": 0,
+                        "used_at": None,
+                        "ip_address": None,
+                        "device_id": None,
+                        "created_at": now_str
+                    })
+                update_operations.append(UpdateOne({"_id": existing["_id"]}, {"$set": update_fields}))
             else:
-                weight_val = 4
+                new_tok = secrets.token_urlsafe(12) if generate_tokens else None
+                s_doc = {
+                    "name": r.get("name") or "Student",
+                    "phone": phone,
+                    "email": r.get("email", ""),
+                    "acm_id": ace_id,
+                    "branch": r.get("branch", ""),
+                    "year": r.get("year", "1st Year"),
+                    "goodies": r.get("goodies", "Yes"),
+                    "gender": r.get("gender", ""),
+                    "registration_id": reg_id,
+                    "extra_data": {
+                        "email": r.get("email", ""),
+                        "gender": r.get("gender", ""),
+                        "mode": r.get("mode", ""),
+                        "registrationType": r.get("registrationType", ""),
+                        "payment": r.get("payment", "")
+                    },
+                    "assigned_ebm_id": None,
+                    "token": new_tok,
+                    "is_contacted": 0,
+                    "contacted_at": None,
+                    "created_at": now_str
+                }
+                students_to_insert.append(s_doc)
+                if new_tok:
+                    invites_for_new.append({
+                        "token": new_tok,
+                        "assigned_to": r.get("name") or "Student",
+                        "student_id": None,
+                        "is_used": 0,
+                        "used_at": None,
+                        "ip_address": None,
+                        "device_id": None,
+                        "created_at": now_str
+                    })
 
-        # Server-side weight cap (between 1 and 20) and secure password hashing
-        weight_val = min(20, max(1, weight_val))
-        hashed_password = generate_password_hash(password_val)
+        updated_count = len(update_operations)
+        inserted_count = len(students_to_insert)
 
-        ebm_to_upsert.append((name_val, username_val, hashed_password, weight_val, now_str))
+        if update_operations:
+            db.students.bulk_write(update_operations, ordered=False)
+        if invites_for_updated:
+            db.invites.insert_many(invites_for_updated)
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        try:
-            for e in ebm_to_upsert:
-                cursor.execute("""
-                    INSERT INTO ebm_members (name, username, password, weight, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(username) DO UPDATE SET
-                        name=excluded.name,
-                        password=excluded.password,
-                        weight=excluded.weight
-                """, e)
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            return jsonify({"error": f"Database transaction failed: {str(e)}"}), 500
+        if students_to_insert:
+            res = db.students.insert_many(students_to_insert)
+            if generate_tokens and invites_for_new:
+                for inv, s_id in zip(invites_for_new, res.inserted_ids):
+                    inv["student_id"] = str(s_id)
+                db.invites.insert_many(invites_for_new)
 
+        return jsonify({
+            "success": True,
+            "message": f"Sync from ACE_REG complete: {inserted_count} new student(s) added, {updated_count} updated.",
+            "inserted_count": inserted_count,
+            "updated_count": updated_count,
+            "tokens_generated": generate_tokens
+        })
+
+# ----------------- DYNAMIC FILTER OPTIONS -----------------
+@admin_bp.route("/api/admin/filter-options", methods=["GET"])
+@admin_required
+def api_get_filter_options():
+    db = get_db()
+    # Collect branches from students and registrations collections
+    student_branches = [b for b in db.students.distinct("branch") if b]
+    reg_branches = [b for b in db.registrations.distinct("branch") if b]
+    all_branches = sorted(list(set(student_branches + reg_branches)))
+
+    years = ["1st Year", "2nd Year", "3rd Year", "4th Year"]
+    goodies = ["Yes", "No"]
+    genders = ["Male", "Female"]
     return jsonify({
-        "success": True,
-        "message": f"Successfully parsed and updated {len(ebm_to_upsert)} EBM team members.",
-        "count": len(ebm_to_upsert)
+        "years": years,
+        "goodies": goodies,
+        "branches": all_branches,
+        "genders": genders
     })
 
-# ----------------- EBM CRUD MANAGEMENT -----------------
 
+# ----------------- EBM TEAM MANAGEMENT -----------------
 @admin_bp.route("/api/admin/ebm/list", methods=["GET"])
 @admin_required
 def api_list_ebms():
-    with get_db() as conn:
-        cursor = conn.cursor()
-        # Plaintext and hashed passwords are intentionally excluded from the query for security
-        cursor.execute("""
-            SELECT e.id, e.name, e.username, e.role, e.weight, e.created_at,
-                   COUNT(s.id) as assigned_count,
-                   SUM(CASE WHEN s.is_contacted = 1 THEN 1 ELSE 0 END) as contacted_count,
-                   SUM(CASE WHEN i.is_used = 1 THEN 1 ELSE 0 END) as joined_count
-            FROM ebm_members e
-            LEFT JOIN students s ON s.assigned_ebm_id = e.id
-            LEFT JOIN invites i ON s.token = i.token
-            GROUP BY e.id
-            ORDER BY e.weight DESC, e.name ASC
-        """)
-        ebms = [dict(r) for r in cursor.fetchall()]
+    db = get_db()
+    ebm_docs = list(db.ebms.find().sort([("weight", -1), ("name", 1)]))
+    ebms = []
+
+    for e in ebm_docs:
+        e_id_str = str(e["_id"])
+        assigned_count = db.students.count_documents({"assigned_ebm_id": e_id_str})
+        contacted_count = db.students.count_documents({"assigned_ebm_id": e_id_str, "is_contacted": 1})
+
+        tokens = [
+            s["token"] for s in db.students.find(
+                {"assigned_ebm_id": e_id_str, "token": {"$ne": None}},
+                {"token": 1}
+            ) if s.get("token")
+        ]
+        joined_count = db.invites.count_documents({"token": {"$in": tokens}, "is_used": 1}) if tokens else 0
+
+        ebms.append({
+            "id": e_id_str,
+            "name": e.get("name", "EBM Member"),
+            "username": e.get("username", e.get("name")),
+            "role": e.get("role", "ebm"),
+            "weight": e.get("weight", 4),
+            "created_at": e.get("created_at", ""),
+            "assigned_count": assigned_count,
+            "contacted_count": contacted_count,
+            "joined_count": joined_count
+        })
+
     return jsonify({"ebms": ebms})
 
 @admin_bp.route("/api/admin/ebm", methods=["POST"])
@@ -384,28 +598,33 @@ def api_list_ebms():
 def api_create_ebm():
     data = request.get_json() or {}
     name = data.get("name", "").strip()
-    username = data.get("username", "").strip().lower()
+    username = data.get("username", "").strip() or re.sub(r"[^a-zA-Z0-9_]", "", name.lower().replace(" ", "_"))
     password = data.get("password", "").strip() or "ebm123"
     weight = min(20, max(1, int(data.get("weight", 4))))
 
-    if not name or not username:
-        return jsonify({"error": "Name and username are required"}), 400
+    if not name:
+        return jsonify({"error": "Name is required"}), 400
 
-    hashed_password = generate_password_hash(password)
+    db = get_db()
+    existing = db.ebms.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}})
+    if existing:
+        return jsonify({"error": "An EBM with this name already exists"}), 400
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with get_db() as conn:
-        try:
-            conn.execute("""
-                INSERT INTO ebm_members (name, username, password, weight, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (name, username, hashed_password, weight, now_str))
-            conn.commit()
-        except sqlite3.IntegrityError:
-            return jsonify({"error": "An EBM with this username already exists"}), 400
+    hashed_password = generate_password_hash(password)
+    doc = {
+        "name": name,
+        "username": username.lower(),
+        "password": hashed_password,
+        "role": "ebm",
+        "weight": weight,
+        "created_at": now_str
+    }
+    db.ebms.insert_one(doc)
 
-    return jsonify({"success": True, "message": f"EBM member {name} added."})
+    return jsonify({"success": True, "message": f"EBM member '{name}' added successfully."})
 
-@admin_bp.route("/api/admin/ebm/<int:ebm_id>", methods=["PUT"])
+@admin_bp.route("/api/admin/ebm/<ebm_id>", methods=["PUT"])
 @admin_required
 def api_update_ebm(ebm_id):
     data = request.get_json() or {}
@@ -413,75 +632,69 @@ def api_update_ebm(ebm_id):
     password = data.get("password", "").strip()
     weight = min(20, max(1, int(data.get("weight", 4))))
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        if password:
-            hashed_password = generate_password_hash(password)
-            cursor.execute("""
-                UPDATE ebm_members SET name = ?, password = ?, weight = ? WHERE id = ?
-            """, (name, hashed_password, weight, ebm_id))
-        else:
-            cursor.execute("""
-                UPDATE ebm_members SET name = ?, weight = ? WHERE id = ?
-            """, (name, weight, ebm_id))
-        conn.commit()
+    db = get_db()
+    oid = safe_object_id(ebm_id)
+    query = {"$or": [{"_id": oid}, {"id": ebm_id}]}
+
+    update_doc = {"weight": weight}
+    if name:
+        update_doc["name"] = name
+    if password:
+        update_doc["password"] = generate_password_hash(password)
+
+    db.ebms.update_one(query, {"$set": update_doc})
     return jsonify({"success": True, "message": "EBM updated successfully"})
 
-@admin_bp.route("/api/admin/ebm/<int:ebm_id>", methods=["DELETE"])
+@admin_bp.route("/api/admin/ebm/<ebm_id>", methods=["DELETE"])
 @admin_required
 def api_delete_ebm(ebm_id):
-    with get_db() as conn:
-        conn.execute("UPDATE students SET assigned_ebm_id = NULL WHERE assigned_ebm_id = ?", (ebm_id,))
-        conn.execute("DELETE FROM ebm_members WHERE id = ?", (ebm_id,))
-        conn.commit()
+    db = get_db()
+    oid = safe_object_id(ebm_id)
+    db.students.update_many({"assigned_ebm_id": str(ebm_id)}, {"$set": {"assigned_ebm_id": None}})
+    db.ebms.delete_one({"$or": [{"_id": oid}, {"id": ebm_id}]})
     return jsonify({"success": True, "message": "EBM deleted and their students unassigned."})
 
 # ----------------- BATCH SPLITTING -----------------
-
 @admin_bp.route("/api/admin/batch/split", methods=["POST"])
 @admin_required
 def api_batch_split():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     reassign_all = bool(data.get("reassign_all", False))
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name, weight FROM ebm_members ORDER BY weight DESC, id ASC")
-        ebms = cursor.fetchall()
+    db = get_db()
+    ebms = list(db.ebms.find().sort([("weight", -1), ("name", 1)]))
 
-        if not ebms:
-            return jsonify({"error": "No EBM members found. Please add or upload EBMs first."}), 400
+    if not ebms:
+        return jsonify({"error": "No EBM members found. Please register or add EBMs first."}), 400
 
-        if reassign_all:
-            cursor.execute("SELECT id FROM students ORDER BY id ASC")
-        else:
-            cursor.execute("SELECT id FROM students WHERE assigned_ebm_id IS NULL ORDER BY id ASC")
-        students = cursor.fetchall()
+    if reassign_all:
+        students = list(db.students.find().sort("_id", 1))
+    else:
+        students = list(db.students.find({
+            "$or": [{"assigned_ebm_id": None}, {"assigned_ebm_id": ""}]
+        }).sort("_id", 1))
 
-        if not students:
-            return jsonify({"message": "No unassigned students to split."}), 200
+    if not students:
+        return jsonify({"message": "No unassigned students to split."}), 200
 
-        # Build weighted pool with weights capped 1-20
-        weighted_pool = []
-        for e in ebms:
-            w = min(20, max(1, int(e["weight"] or 1)))
-            weighted_pool.extend([e["id"]] * w)
+    # Build weighted pool with weights capped 1-20
+    weighted_pool = []
+    for e in ebms:
+        w = min(20, max(1, int(e.get("weight", 4))))
+        weighted_pool.extend([str(e["_id"])] * w)
 
-        pool_len = len(weighted_pool)
+    pool_len = len(weighted_pool)
 
-        # Distribute continuously across the weighted pool rather than resetting index 0 every batch
-        current_offset = 0
-        if not reassign_all:
-            cursor.execute("SELECT COUNT(*) FROM students WHERE assigned_ebm_id IS NOT NULL")
-            current_offset = cursor.fetchone()[0]
+    # Distribute continuously across the weighted pool rather than resetting index 0 every batch
+    current_offset = 0
+    if not reassign_all:
+        current_offset = db.students.count_documents({
+            "assigned_ebm_id": {"$nin": [None, ""]}
+        })
 
-        assignments = []
-        for idx, s in enumerate(students):
-            assigned_ebm_id = weighted_pool[(current_offset + idx) % pool_len]
-            assignments.append((assigned_ebm_id, s["id"]))
-
-        cursor.executemany("UPDATE students SET assigned_ebm_id = ? WHERE id = ?", assignments)
-        conn.commit()
+    for idx, s in enumerate(students):
+        assigned_ebm_id = weighted_pool[(current_offset + idx) % pool_len]
+        db.students.update_one({"_id": s["_id"]}, {"$set": {"assigned_ebm_id": assigned_ebm_id}})
 
     return jsonify({
         "success": True,
@@ -501,18 +714,14 @@ def api_batch_reassign():
 
     target_ebm_id = None
     if raw_ebm_id is not None and str(raw_ebm_id).strip() not in ["", "unassigned", "null", "None", "-1"]:
-        try:
-            target_ebm_id = int(raw_ebm_id)
-        except ValueError:
-            target_ebm_id = None
+        target_ebm_id = str(raw_ebm_id).strip()
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.executemany(
-            "UPDATE students SET assigned_ebm_id = ? WHERE id = ?",
-            [(target_ebm_id, sid) for sid in student_ids]
-        )
-        conn.commit()
+    db = get_db()
+    oids = [safe_object_id(sid) for sid in student_ids]
+    db.students.update_many(
+        {"$or": [{"_id": {"$in": oids}}, {"id": {"$in": student_ids}}]},
+        {"$set": {"assigned_ebm_id": target_ebm_id}}
+    )
 
     return jsonify({"success": True, "message": f"Successfully reassigned {len(student_ids)} student(s)."})
 
@@ -525,92 +734,54 @@ def api_batch_transfer():
     raw_count = data.get("count")
     student_ids = data.get("student_ids", [])
 
-    from_ebm_id = None
-    if raw_from is not None and str(raw_from).strip() not in ["", "unassigned", "null", "None", "-1"]:
+    from_ebm_id = str(raw_from).strip() if raw_from and str(raw_from).strip() not in ["", "unassigned", "null", "-1"] else None
+    target_ebm_id = str(raw_to).strip() if raw_to and str(raw_to).strip() not in ["", "unassigned", "null", "-1"] else None
+
+    db = get_db()
+    if student_ids:
+        oids = [safe_object_id(sid) for sid in student_ids]
+        db.students.update_many(
+            {"$or": [{"_id": {"$in": oids}}, {"id": {"$in": student_ids}}]},
+            {"$set": {"assigned_ebm_id": target_ebm_id}}
+        )
+        moved_count = len(student_ids)
+    elif raw_count:
         try:
-            from_ebm_id = int(raw_from)
+            count = int(raw_count)
         except ValueError:
-            from_ebm_id = None
+            return jsonify({"error": "Invalid student count"}), 400
+        if count <= 0:
+            return jsonify({"error": "Count must be greater than 0"}), 400
 
-    target_ebm_id = None
-    if raw_to is not None and str(raw_to).strip() not in ["", "unassigned", "null", "None", "-1"]:
-        try:
-            target_ebm_id = int(raw_to)
-        except ValueError:
-            target_ebm_id = None
+        query = {"assigned_ebm_id": from_ebm_id} if from_ebm_id else {"assigned_ebm_id": {"$in": [None, ""]}}
+        docs = list(db.students.find(query).sort([("is_contacted", 1), ("_id", 1)]).limit(count))
+        if not docs:
+            return jsonify({"error": "No students available to transfer from selected source"}), 400
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        if student_ids:
-            cursor.executemany(
-                "UPDATE students SET assigned_ebm_id = ? WHERE id = ?",
-                [(target_ebm_id, sid) for sid in student_ids]
-            )
-            moved_count = len(student_ids)
-        elif raw_count:
-            try:
-                count = int(raw_count)
-            except ValueError:
-                return jsonify({"error": "Invalid student count"}), 400
-            if count <= 0:
-                return jsonify({"error": "Count must be greater than 0"}), 400
+        doc_ids = [d["_id"] for d in docs]
+        db.students.update_many({"_id": {"$in": doc_ids}}, {"$set": {"assigned_ebm_id": target_ebm_id}})
+        moved_count = len(doc_ids)
+    else:
+        return jsonify({"error": "Please provide a count or specific student IDs to transfer"}), 400
 
-            if from_ebm_id is not None:
-                cursor.execute("""
-                    SELECT id FROM students 
-                    WHERE assigned_ebm_id = ?
-                    ORDER BY is_contacted ASC, id ASC
-                    LIMIT ?
-                """, (from_ebm_id, count))
-            else:
-                cursor.execute("""
-                    SELECT id FROM students 
-                    WHERE assigned_ebm_id IS NULL
-                    ORDER BY is_contacted ASC, id ASC
-                    LIMIT ?
-                """, (count,))
-            ids_to_move = [r[0] for r in cursor.fetchall()]
-            if not ids_to_move:
-                return jsonify({"error": "No students available to transfer from selected source"}), 400
+    return jsonify({"success": True, "message": f"Successfully transferred {moved_count} student(s)."})
 
-            cursor.executemany(
-                "UPDATE students SET assigned_ebm_id = ? WHERE id = ?",
-                [(target_ebm_id, sid) for sid in ids_to_move]
-            )
-            moved_count = len(ids_to_move)
-        else:
-            return jsonify({"error": "Please provide a count or specific student IDs to transfer"}), 400
-
-        conn.commit()
-
-    return jsonify({
-        "success": True, 
-        "message": f"Successfully transferred {moved_count} student(s)."
-    })
-
-@admin_bp.route("/api/admin/students/<int:student_id>/assign", methods=["POST"])
+@admin_bp.route("/api/admin/students/<student_id>/assign", methods=["POST"])
 @admin_required
 def api_assign_single_student(student_id):
     data = request.get_json() or {}
     raw_ebm_id = data.get("ebm_id")
-    target_ebm_id = None
-    if raw_ebm_id is not None and str(raw_ebm_id).strip() not in ["", "unassigned", "null", "None", "-1"]:
-        try:
-            target_ebm_id = int(raw_ebm_id)
-        except ValueError:
-            target_ebm_id = None
+    target_ebm_id = str(raw_ebm_id).strip() if raw_ebm_id and str(raw_ebm_id).strip() not in ["", "unassigned", "null", "-1"] else None
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE students SET assigned_ebm_id = ? WHERE id = ?", (target_ebm_id, student_id))
-        
-        ebm_name = "Unassigned"
-        if target_ebm_id:
-            cursor.execute("SELECT name FROM ebm_members WHERE id = ?", (target_ebm_id,))
-            row = cursor.fetchone()
-            if row:
-                ebm_name = row[0]
-        conn.commit()
+    db = get_db()
+    oid = safe_object_id(student_id)
+    db.students.update_one({"$or": [{"_id": oid}, {"id": student_id}]}, {"$set": {"assigned_ebm_id": target_ebm_id}})
+
+    ebm_name = "Unassigned"
+    if target_ebm_id:
+        e_doc = db.ebms.find_one({"$or": [{"_id": safe_object_id(target_ebm_id)}, {"id": target_ebm_id}]})
+        if e_doc:
+            ebm_name = e_doc.get("name", "EBM Member")
 
     return jsonify({
         "success": True,
@@ -619,8 +790,7 @@ def api_assign_single_student(student_id):
         "ebm_name": ebm_name
     })
 
-# ----------------- STUDENT DIRECTORY & TOKEN RENEWAL -----------------
-
+# ----------------- DYNAMIC STUDENT DIRECTORY (YEAR & GOODIES) -----------------
 @admin_bp.route("/api/admin/students", methods=["GET"])
 @admin_required
 def api_admin_students():
@@ -628,58 +798,102 @@ def api_admin_students():
     search = request.args.get("search", "").strip()
     contacted = request.args.get("contacted")
     joined = request.args.get("joined")
+    year = request.args.get("year", "").strip()
+    goodies = request.args.get("goodies", "").strip()
+    branch = request.args.get("branch", "").strip()
+    gender = request.args.get("gender", "").strip()
     page = max(1, int(request.args.get("page", 1)))
     limit = min(max(10, int(request.args.get("limit", 50))), 500)
     offset = (page - 1) * limit
 
     cfg = load_config()
     base_url = cfg.get("base_url", "http://localhost:5000").rstrip("/")
+    db = get_db()
 
-    query = """
-        SELECT s.id, s.name, s.phone, s.acm_id, s.branch, s.extra_data, s.token,
-               s.is_contacted, s.contacted_at, s.created_at,
-               e.id as ebm_id, e.name as ebm_name,
-               i.is_used, i.used_at, i.ip_address
-        FROM students s
-        LEFT JOIN ebm_members e ON s.assigned_ebm_id = e.id
-        LEFT JOIN invites i ON s.token = i.token
-        WHERE 1=1
-    """
-    params = []
+    filter_query = {}
 
     if ebm_id:
         if ebm_id == "unassigned":
-            query += " AND s.assigned_ebm_id IS NULL"
+            filter_query["assigned_ebm_id"] = {"$in": [None, ""]}
         else:
-            query += " AND s.assigned_ebm_id = ?"
-            params.append(ebm_id)
+            filter_query["assigned_ebm_id"] = str(ebm_id)
+
     if contacted is not None and contacted != "":
-        query += " AND s.is_contacted = ?"
-        params.append(int(contacted))
-    if joined is not None and joined != "":
-        query += " AND i.is_used = ?"
-        params.append(int(joined))
+        filter_query["is_contacted"] = int(contacted)
+
+    # Dynamic Year Filter (matches 1, 1st Year, 2, 2nd Year, etc.)
+    if year and year.lower() not in ["all", "any"]:
+        filter_query["year"] = {"$regex": f"^{re.escape(year)}", "$options": "i"}
+
+    # Dynamic Goodies Filter (Yes / No)
+    if goodies and goodies.lower() not in ["all", "any"]:
+        if goodies.lower() in ["yes", "true", "1", "eligible"]:
+            filter_query["goodies"] = {"$in": [True, 1, "Yes", "yes", "YES", "Eligible", "eligible"]}
+        elif goodies.lower() in ["no", "false", "0", "not eligible"]:
+            filter_query["goodies"] = {"$in": [False, 0, "No", "no", "NO", "Not Eligible", None, ""]}
+
+    # Dynamic Branch Filter
+    if branch and branch.lower() not in ["all", "any"]:
+        filter_query["branch"] = {"$regex": f"^{re.escape(branch)}$", "$options": "i"}
+
+    # Dynamic Gender Filter
+    if gender and gender.lower() not in ["all", "any"]:
+        filter_query["gender"] = {"$regex": f"^{re.escape(gender)}$", "$options": "i"}
+
     if search:
-        query += " AND (s.name LIKE ? OR s.phone LIKE ? OR s.acm_id LIKE ?)"
-        s_term = f"%{search}%"
-        params.extend([s_term, s_term, s_term])
+        s_regex = {"$regex": re.escape(search), "$options": "i"}
+        filter_query["$or"] = [{"name": s_regex}, {"phone": s_regex}, {"acm_id": s_regex}, {"email": s_regex}]
 
-    count_query = f"SELECT COUNT(*) FROM ({query})"
-    query += f" ORDER BY s.id ASC LIMIT {limit} OFFSET {offset}"
+    # Handle joined filter via invite tokens if requested
+    if joined is not None and joined != "":
+        is_used_target = int(joined)
+        used_tokens = [
+            inv["token"] for inv in db.invites.find({"is_used": is_used_target}, {"token": 1})
+        ]
+        if is_used_target == 1:
+            filter_query["token"] = {"$in": used_tokens}
+        else:
+            filter_query["$or"] = [
+                {"token": {"$in": used_tokens}},
+                {"token": None}
+            ]
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(count_query, params)
-        total_count = cursor.fetchone()[0]
+    total_count = db.students.count_documents(filter_query)
+    student_docs = list(db.students.find(filter_query).sort("_id", 1).skip(offset).limit(limit))
 
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+    # Pre-fetch EBM names and token invite statuses
+    ebm_map = {str(e["_id"]): e.get("name", "EBM Member") for e in db.ebms.find()}
+    student_tokens = [s.get("token") for s in student_docs if s.get("token")]
+    invites_map = {inv["token"]: inv for inv in db.invites.find({"token": {"$in": student_tokens}})} if student_tokens else {}
 
-        students = []
-        for r in rows:
-            d = dict(r)
-            d["full_invite_link"] = f"{base_url}/join/{d['token']}" if d.get("token") else ""
-            students.append(d)
+    students = []
+    for s in student_docs:
+        s_id = str(s["_id"])
+        tok = s.get("token")
+        inv = invites_map.get(tok, {}) if tok else {}
+
+        students.append({
+            "id": s_id,
+            "name": s.get("name", "Student"),
+            "phone": s.get("phone", ""),
+            "email": s.get("email", ""),
+            "gender": s.get("gender", ""),
+            "acm_id": s.get("acm_id", ""),
+            "branch": s.get("branch", ""),
+            "year": s.get("year", "1"),
+            "goodies": s.get("goodies", "Yes"),
+            "extra_data": json.dumps(s.get("extra_data", {})) if isinstance(s.get("extra_data"), dict) else s.get("extra_data", ""),
+            "token": tok or "",
+            "full_invite_link": f"{base_url}/join/{tok}" if tok else "",
+            "is_contacted": s.get("is_contacted", 0),
+            "contacted_at": s.get("contacted_at", ""),
+            "created_at": s.get("created_at", ""),
+            "ebm_id": s.get("assigned_ebm_id"),
+            "ebm_name": ebm_map.get(str(s.get("assigned_ebm_id")), "Unassigned"),
+            "is_used": inv.get("is_used", 0),
+            "used_at": inv.get("used_at", ""),
+            "ip_address": inv.get("ip_address", "")
+        })
 
     return jsonify({
         "students": students,
@@ -689,66 +903,66 @@ def api_admin_students():
         "total_pages": (total_count + limit - 1) // limit if limit else 1
     })
 
-@admin_bp.route("/api/admin/tokens/renew/<int:student_id>", methods=["POST"])
+# ----------------- TOKEN RENEWAL & GENERATION -----------------
+@admin_bp.route("/api/admin/tokens/renew/<student_id>", methods=["POST"])
 @admin_required
 def api_renew_token(student_id):
     data = request.get_json() or {}
     action = data.get("action", "reset")
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db = get_db()
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM students WHERE id = ?", (student_id,))
-        student = cursor.fetchone()
-        if not student:
-            return jsonify({"error": "Student not found"}), 404
+    oid = safe_object_id(student_id)
+    student = db.students.find_one({"$or": [{"_id": oid}, {"id": student_id}]})
+    if not student:
+        return jsonify({"error": "Student not found"}), 404
 
-        old_token = student["token"]
+    old_token = student.get("token")
 
-        if action == "new_token" or not old_token:
-            new_tok = secrets.token_urlsafe(12)
-            cursor.execute("UPDATE students SET token = ? WHERE id = ?", (new_tok, student_id))
-            cursor.execute("""
-                INSERT INTO invites (token, assigned_to, student_id, is_used, used_at, ip_address, created_at)
-                VALUES (?, ?, ?, 0, NULL, NULL, ?)
-            """, (new_tok, student["name"], student_id, now_str))
-            token_to_return = new_tok
-        else:
-            cursor.execute("""
-                UPDATE invites 
-                SET is_used = 0, used_at = NULL, device_id = NULL, ip_address = NULL
-                WHERE token = ?
-            """, (old_token,))
-            token_to_return = old_token
-
-        conn.commit()
+    if action == "new_token" or not old_token:
+        new_tok = secrets.token_urlsafe(12)
+        db.students.update_one({"_id": student["_id"]}, {"$set": {"token": new_tok}})
+        db.invites.insert_one({
+            "token": new_tok,
+            "assigned_to": student.get("name", "Student"),
+            "student_id": str(student["_id"]),
+            "is_used": 0,
+            "used_at": None,
+            "ip_address": None,
+            "device_id": None,
+            "created_at": now_str
+        })
+        token_to_return = new_tok
+    else:
+        db.invites.update_one(
+            {"token": old_token},
+            {"$set": {"is_used": 0, "used_at": None, "device_id": None, "ip_address": None}}
+        )
+        token_to_return = old_token
 
     return jsonify({
         "success": True,
-        "message": f"Token renewed for {student['name']}",
+        "message": f"Token renewed for {student.get('name')}",
         "token": token_to_return
     })
 
-@admin_bp.route("/api/admin/students/<int:student_id>", methods=["DELETE"])
+@admin_bp.route("/api/admin/students/<student_id>", methods=["DELETE"])
 @admin_required
 def api_delete_student(student_id):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT token FROM students WHERE id = ?", (student_id,))
-        student = cursor.fetchone()
-        if student and student["token"]:
-            cursor.execute("DELETE FROM invites WHERE token = ?", (student["token"],))
-        cursor.execute("DELETE FROM students WHERE id = ?", (student_id,))
-        conn.commit()
+    db = get_db()
+    oid = safe_object_id(student_id)
+    student = db.students.find_one({"$or": [{"_id": oid}, {"id": student_id}]})
+    if student and student.get("token"):
+        db.invites.delete_many({"token": student["token"]})
+    db.students.delete_one({"$or": [{"_id": oid}, {"id": student_id}]})
     return jsonify({"success": True, "message": "Student deleted."})
 
 @admin_bp.route("/api/admin/students/clear-all", methods=["POST"])
 @admin_required
 def api_clear_all_students():
-    with get_db() as conn:
-        conn.execute("DELETE FROM students")
-        conn.execute("DELETE FROM invites WHERE student_id IS NOT NULL")
-        conn.commit()
+    db = get_db()
+    db.students.delete_many({})
+    db.invites.delete_many({})
     return jsonify({"success": True, "message": "All students and associated invite links have been cleared."})
 
 @admin_bp.route("/api/admin/export/links", methods=["GET"])
@@ -756,45 +970,42 @@ def api_clear_all_students():
 def api_export_links_csv():
     cfg = load_config()
     base_url = cfg.get("base_url", "http://localhost:5000").rstrip("/")
+    db = get_db()
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT s.id, s.name, s.phone, s.acm_id, s.branch, s.is_contacted, s.contacted_at,
-                   e.name as assigned_ebm,
-                   i.token, i.is_used, i.used_at, i.ip_address, s.created_at
-            FROM students s
-            LEFT JOIN ebm_members e ON s.assigned_ebm_id = e.id
-            LEFT JOIN invites i ON s.token = i.token
-            ORDER BY s.id ASC
-        """)
-        records = cursor.fetchall()
+    student_docs = list(db.students.find().sort("_id", 1))
+    ebm_map = {str(e["_id"]): e.get("name", "EBM Member") for e in db.ebms.find()}
+    tokens = [s.get("token") for s in student_docs if s.get("token")]
+    inv_map = {inv["token"]: inv for inv in db.invites.find({"token": {"$in": tokens}})} if tokens else {}
 
     output = io.StringIO()
     output.write("\ufeff")
     writer = csv.writer(output)
     writer.writerow([
-        "Student ID", "Name", "Phone", "ACM ID", "Branch", "Assigned EBM",
+        "Student ID", "Name", "Phone", "ACM ID", "Branch", "Year", "Goodies", "Assigned EBM",
         "One-Time Link", "Redeemed Status", "Redeemed At", "Contacted Status", "Contacted At", "IP Address"
     ])
 
-    for r in records:
-        link = f"{base_url}/join/{r['token']}" if r["token"] else ""
-        status = "Redeemed" if r["is_used"] else "Active"
-        contacted = "Yes" if r["is_contacted"] else "No"
+    for s in student_docs:
+        tok = s.get("token", "")
+        inv = inv_map.get(tok, {})
+        link = f"{base_url}/join/{tok}" if tok else ""
+        status = "Redeemed" if inv.get("is_used") else ("Active" if tok else "No Token")
+        contacted = "Yes" if s.get("is_contacted") else "No"
         writer.writerow([
-            r["id"],
-            r["name"],
-            r["phone"] or "",
-            r["acm_id"] or "",
-            r["branch"] or "",
-            r["assigned_ebm"] or "Unassigned",
+            str(s["_id"]),
+            s.get("name", ""),
+            s.get("phone", ""),
+            s.get("acm_id", ""),
+            s.get("branch", ""),
+            s.get("year", "1"),
+            s.get("goodies", "Yes"),
+            ebm_map.get(str(s.get("assigned_ebm_id")), "Unassigned"),
             link,
             status,
-            r["used_at"] or "",
+            inv.get("used_at", ""),
             contacted,
-            r["contacted_at"] or "",
-            r["ip_address"] or ""
+            s.get("contacted_at", ""),
+            inv.get("ip_address", "")
         ])
 
     return Response(
@@ -804,14 +1015,19 @@ def api_export_links_csv():
     )
 
 # ----------------- MESSAGE TEMPLATES -----------------
-
 @admin_bp.route("/api/templates", methods=["GET"])
 def api_get_templates():
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM message_templates ORDER BY is_default DESC, id DESC")
-        templates = [dict(r) for r in cursor.fetchall()]
-    return jsonify({"templates": templates})
+    db = get_db()
+    tpls = list(db.message_templates.find().sort([("is_default", -1), ("_id", -1)]))
+    result = []
+    for t in tpls:
+        result.append({
+            "id": str(t["_id"]),
+            "title": t.get("title", ""),
+            "content": t.get("content", ""),
+            "is_default": t.get("is_default", 0)
+        })
+    return jsonify({"templates": result})
 
 @admin_bp.route("/api/templates", methods=["POST"])
 @admin_required
@@ -824,20 +1040,22 @@ def api_create_template():
     if not title or not content:
         return jsonify({"error": "Title and content are required"}), 400
 
+    db = get_db()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with get_db() as conn:
-        cursor = conn.cursor()
-        if is_default:
-            cursor.execute("UPDATE message_templates SET is_default = 0")
-        cursor.execute("""
-            INSERT INTO message_templates (title, content, is_default, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (title, content, is_default, now_str, now_str))
-        conn.commit()
 
-    return jsonify({"success": True, "message": "Message template saved."})
+    if is_default:
+        db.message_templates.update_many({}, {"$set": {"is_default": 0}})
 
-@admin_bp.route("/api/templates/<int:template_id>", methods=["PUT"])
+    res = db.message_templates.insert_one({
+        "title": title,
+        "content": content,
+        "is_default": is_default,
+        "created_at": now_str,
+        "updated_at": now_str
+    })
+    return jsonify({"success": True, "message": "Message template saved.", "id": str(res.inserted_id)})
+
+@admin_bp.route("/api/templates/<template_id>", methods=["PUT"])
 @admin_required
 def api_update_template(template_id):
     data = request.get_json() or {}
@@ -845,33 +1063,32 @@ def api_update_template(template_id):
     content = data.get("content", "").strip()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with get_db() as conn:
-        conn.execute("""
-            UPDATE message_templates SET title = ?, content = ?, updated_at = ? WHERE id = ?
-        """, (title, content, now_str, template_id))
-        conn.commit()
-
+    db = get_db()
+    oid = safe_object_id(template_id)
+    db.message_templates.update_one(
+        {"$or": [{"_id": oid}, {"id": template_id}]},
+        {"$set": {"title": title, "content": content, "updated_at": now_str}}
+    )
     return jsonify({"success": True, "message": "Template updated."})
 
-@admin_bp.route("/api/templates/<int:template_id>/set-default", methods=["POST"])
+@admin_bp.route("/api/templates/<template_id>/set-default", methods=["POST"])
 @admin_required
 def api_set_default_template(template_id):
-    with get_db() as conn:
-        conn.execute("UPDATE message_templates SET is_default = 0")
-        conn.execute("UPDATE message_templates SET is_default = 1 WHERE id = ?", (template_id,))
-        conn.commit()
+    db = get_db()
+    oid = safe_object_id(template_id)
+    db.message_templates.update_many({}, {"$set": {"is_default": 0}})
+    db.message_templates.update_one({"$or": [{"_id": oid}, {"id": template_id}]}, {"$set": {"is_default": 1}})
     return jsonify({"success": True, "message": "Default template updated."})
 
-@admin_bp.route("/api/templates/<int:template_id>", methods=["DELETE"])
+@admin_bp.route("/api/templates/<template_id>", methods=["DELETE"])
 @admin_required
 def api_delete_template(template_id):
-    with get_db() as conn:
-        conn.execute("DELETE FROM message_templates WHERE id = ?", (template_id,))
-        conn.commit()
+    db = get_db()
+    oid = safe_object_id(template_id)
+    db.message_templates.delete_one({"$or": [{"_id": oid}, {"id": template_id}]})
     return jsonify({"success": True, "message": "Template deleted."})
 
 # ----------------- CONFIG SETTINGS -----------------
-
 @admin_bp.route("/api/admin/config", methods=["GET", "POST"])
 @admin_required
 def api_admin_config():
@@ -886,6 +1103,7 @@ def api_admin_config():
             cfg["admin_password"] = data["admin_password"].strip()
         save_config(cfg)
         return jsonify({"success": True, "message": "Configuration saved successfully."})
+
     cfg = load_config()
     safe_cfg = {
         "whatsapp_group_link": cfg.get("whatsapp_group_link", ""),

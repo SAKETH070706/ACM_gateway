@@ -53,49 +53,50 @@ def join_group(token):
     now = datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM invites WHERE token = ?", (token,))
-        invite = cursor.fetchone()
+    db = get_db()
+    invite = db.invites.find_one({"token": token})
 
-        if not invite:
-            return render_template("invalid.html"), 404
+    if not invite:
+        return render_template("invalid.html"), 404
 
-        code = extract_invite_code(group_link)
-        deep_link = f"whatsapp://chat?code={code}" if code else group_link
+    code = extract_invite_code(group_link)
+    deep_link = f"whatsapp://chat?code={code}" if code else group_link
 
-        if invite["is_used"]:
-            # Strict Single-Device Lock:
-            # ONLY the exact device/browser that has the secret device cookie AND is within 15 minutes can access!
-            is_same_device = bool(client_device_id and invite["device_id"] and client_device_id == invite["device_id"])
-            within_grace = False
+    if invite.get("is_used"):
+        # Strict Single-Device Lock:
+        # ONLY the exact device/browser that has the secret device cookie AND is within 15 minutes can access!
+        is_same_device = bool(client_device_id and invite.get("device_id") and client_device_id == invite.get("device_id"))
+        within_grace = False
 
-            if is_same_device and invite["used_at"]:
-                try:
-                    used_dt = datetime.strptime(invite["used_at"], "%Y-%m-%d %H:%M:%S")
-                    if (now - used_dt).total_seconds() < 900:  # 15 min window
-                        within_grace = True
-                except Exception:
-                    pass
+        if is_same_device and invite.get("used_at"):
+            try:
+                used_dt = datetime.strptime(invite["used_at"], "%Y-%m-%d %H:%M:%S")
+                if (now - used_dt).total_seconds() < 900:  # 15 min window
+                    within_grace = True
+            except Exception:
+                pass
 
-            if not within_grace:
-                return render_template("expired.html", used_at=invite["used_at"]), 410
+        if not within_grace:
+            return render_template("expired.html", used_at=invite.get("used_at")), 410
 
-            return render_template("redirect.html", group_url=group_link, deep_link=deep_link, code=code)
+        return render_template("redirect.html", group_url=group_link, deep_link=deep_link, code=code)
 
-        else:
-            # First human visit on first device: issue unique secret device token
-            new_device_id = secrets.token_hex(16)
-            cursor.execute("""
-                UPDATE invites 
-                SET is_used = 1, used_at = ?, ip_address = ?, device_id = ? 
-                WHERE token = ? AND is_used = 0
-            """, (now_str, client_ip, new_device_id, token))
-            conn.commit()
+    else:
+        # First human visit on first device: issue unique secret device token
+        new_device_id = secrets.token_hex(16)
+        result = db.invites.update_one(
+            {"token": token, "is_used": 0},
+            {"$set": {
+                "is_used": 1,
+                "used_at": now_str,
+                "ip_address": client_ip,
+                "device_id": new_device_id
+            }}
+        )
 
-            if cursor.rowcount == 0:
-                return render_template("expired.html", used_at=now_str), 410
+        if result.modified_count == 0:
+            return render_template("expired.html", used_at=now_str), 410
 
-            resp = make_response(render_template("redirect.html", group_url=group_link, deep_link=deep_link, code=code))
-            resp.set_cookie(cookie_name, new_device_id, max_age=900, httponly=True, samesite="Lax")
-            return resp
+        resp = make_response(render_template("redirect.html", group_url=group_link, deep_link=deep_link, code=code))
+        resp.set_cookie(cookie_name, new_device_id, max_age=900, httponly=True, samesite="Lax")
+        return resp

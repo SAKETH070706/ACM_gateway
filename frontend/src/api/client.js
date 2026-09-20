@@ -45,7 +45,7 @@ export async function apiRequest(endpoint, options = {}) {
 
   const response = await fetch(targetUrl, config);
   const contentType = response.headers.get('content-type');
-  
+
   let data;
   if (contentType && contentType.includes('application/json')) {
     data = await response.json();
@@ -67,7 +67,9 @@ export async function apiRequest(endpoint, options = {}) {
 export const api = {
   // Auth
   loginAdmin: (password) => apiRequest('/api/auth/admin/login', { method: 'POST', body: { password } }),
-  loginEbm: (username, password) => apiRequest('/api/auth/ebm/login', { method: 'POST', body: { username, password } }),
+  loginEbm: (name, password) => apiRequest('/api/auth/ebm/login', { method: 'POST', body: { name, password } }),
+  getEbmNames: () => apiRequest('/api/ebm/list-names'),
+  registerEbm: (data) => apiRequest('/api/auth/ebm/register', { method: 'POST', body: data }),
   getMe: () => apiRequest('/api/auth/me'),
   logout: () => apiRequest('/api/auth/logout', { method: 'POST' }),
 
@@ -97,6 +99,8 @@ export const api = {
     const query = new URLSearchParams(params).toString();
     return apiRequest(`/api/admin/students?${query}`);
   },
+  getFilterOptions: () => apiRequest('/api/admin/filter-options'),
+  syncRegistrations: (payload = {}) => apiRequest('/api/admin/sync/registrations', { method: 'POST', body: payload }),
   renewToken: (studentId, action = 'reset') => apiRequest(`/api/admin/tokens/renew/${studentId}`, { method: 'POST', body: { action } }),
   deleteStudent: (studentId) => apiRequest(`/api/admin/students/${studentId}`, { method: 'DELETE' }),
   clearAllStudents: () => apiRequest('/api/admin/students/clear-all', { method: 'POST' }),

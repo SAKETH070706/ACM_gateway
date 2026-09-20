@@ -23,7 +23,24 @@ export default function AdminDashboard({ showToast }) {
   const [filterEbm, setFilterEbm] = useState('');
   const [filterContacted, setFilterContacted] = useState('');
   const [filterJoined, setFilterJoined] = useState('');
+  const [filterYear, setFilterYear] = useState('');
+  const [filterGoodies, setFilterGoodies] = useState('');
+  const [filterBranch, setFilterBranch] = useState('');
+  const [filterGender, setFilterGender] = useState('');
+  const [availableBranches, setAvailableBranches] = useState([
+    'AIDS', 'AIML', 'CIC', 'CIVIL', 'CSBS', 'CSD', 'CSE', 'CSIT', 'ECE', 'EEE', 'IT', 'MECH'
+  ]);
   const [currentPage, setCurrentPage] = useState(1);
+
+  // Live ACM DB Sync Modal
+  const [syncModalOpen, setSyncModalOpen] = useState(false);
+  const [syncForm, setSyncForm] = useState({
+    year: '1st Year',
+    goodies: 'all',
+    generate_tokens: true,
+    mode: 'sync',
+    loading: false
+  });
 
   // Modals & Forms
   const [renewModal, setRenewModal] = useState({ open: false, student: null });
@@ -50,6 +67,7 @@ export default function AdminDashboard({ showToast }) {
   // CSV Upload States
   const [studentFile, setStudentFile] = useState(null);
   const [uploadMode, setUploadMode] = useState('overwrite'); // 'overwrite' or 'sync'
+  const [generateTokens, setGenerateTokens] = useState(true);
   const [ebmFile, setEbmFile] = useState(null);
   const [uploading, setUploading] = useState(false);
 
@@ -61,7 +79,7 @@ export default function AdminDashboard({ showToast }) {
     if (activeTab === 'students') {
       loadStudents();
     }
-  }, [activeTab, search, filterEbm, filterContacted, filterJoined, currentPage]);
+  }, [activeTab, search, filterEbm, filterContacted, filterJoined, filterYear, filterGoodies, filterBranch, filterGender, currentPage]);
 
   const loadInitialData = async () => {
     setLoading(true);
@@ -76,6 +94,12 @@ export default function AdminDashboard({ showToast }) {
       setEbms(ebmRes.ebms || []);
       setTemplates(tplRes.templates || []);
       setConfig(cfgRes);
+
+      api.getFilterOptions().then((opt) => {
+        if (opt && opt.branches && opt.branches.length > 0) {
+          setAvailableBranches(opt.branches);
+        }
+      }).catch(() => {});
     } catch (err) {
       showToast(err.message, 'error');
     } finally {
@@ -91,12 +115,46 @@ export default function AdminDashboard({ showToast }) {
         search,
         ebm_id: filterEbm,
         contacted: filterContacted,
-        joined: filterJoined
+        joined: filterJoined,
+        year: filterYear,
+        goodies: filterGoodies,
+        branch: filterBranch,
+        gender: filterGender
       };
       const res = await api.getStudents(params);
       setStudentsData(res);
     } catch (err) {
       showToast(err.message, 'error');
+    }
+  };
+
+  // --- Actions: Direct ACM MongoDB Sync ---
+  const handleRunSyncDb = async () => {
+    if (syncForm.mode === 'overwrite') {
+      const confirmed = window.confirm(
+        'OVERWRITE MODE WARNING:\n\nThis will replace the student roster in the portal with the matching records from ACE_REG.registrations. Proceed?'
+      );
+      if (!confirmed) return;
+    }
+
+    setSyncForm((prev) => ({ ...prev, loading: true }));
+    try {
+      const res = await api.syncRegistrations({
+        year: syncForm.year,
+        goodies: syncForm.goodies,
+        generate_tokens: syncForm.generate_tokens,
+        mode: syncForm.mode
+      });
+      showToast(res.message);
+      setSyncModalOpen(false);
+      loadInitialData();
+      if (activeTab === 'students') {
+        loadStudents();
+      }
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setSyncForm((prev) => ({ ...prev, loading: false }));
     }
   };
 
@@ -107,7 +165,7 @@ export default function AdminDashboard({ showToast }) {
 
     if (uploadMode === 'overwrite') {
       const confirmed = window.confirm(
-        'OVERWRITE MODE SELECTED:\n\nThis will replace the student roster and issue fresh one-time links. Existing student records will be removed. Proceed?'
+        'OVERWRITE MODE SELECTED:\n\nThis will replace the student roster in MongoDB. Proceed?'
       );
       if (!confirmed) return;
     }
@@ -116,6 +174,7 @@ export default function AdminDashboard({ showToast }) {
     const fd = new FormData();
     fd.append('file', studentFile);
     fd.append('mode', uploadMode);
+    fd.append('generate_tokens', generateTokens ? 'true' : 'false');
 
     try {
       const res = await api.uploadStudentsCsv(fd);
@@ -824,6 +883,40 @@ export default function AdminDashboard({ showToast }) {
                 />
               </label>
 
+              {/* Conditional Token Generation Toggle */}
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 10,
+                  padding: '12px 14px',
+                  background: generateTokens ? '#F0FDF4' : '#F8FAFC',
+                  border: `1px solid ${generateTokens ? '#BBF7D0' : 'var(--border)'}`,
+                  borderRadius: 'var(--radius)',
+                  marginBottom: 16,
+                  cursor: 'pointer'
+                }}
+                onClick={() => setGenerateTokens(!generateTokens)}
+              >
+                <input
+                  type="checkbox"
+                  id="generate-tokens-toggle"
+                  checked={generateTokens}
+                  onChange={(e) => setGenerateTokens(e.target.checked)}
+                  style={{ marginTop: 2, cursor: 'pointer' }}
+                />
+                <div>
+                  <strong style={{ display: 'block', fontSize: 13, color: 'var(--heading)' }}>
+                    Generate One-Time WhatsApp Tokens
+                  </strong>
+                  <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                    {generateTokens
+                      ? 'Secure, single-use tracking tokens will be allocated for each student in MongoDB.'
+                      : 'Students will be ingested for viewing/goodies tracking without creating WhatsApp links.'}
+                  </span>
+                </div>
+              </div>
+
               <button
                 type="submit"
                 className="btn btn-primary"
@@ -831,7 +924,7 @@ export default function AdminDashboard({ showToast }) {
                 disabled={!studentFile || uploading}
               >
                 <UploadCloud size={16} />
-                <span>{uploading ? 'Processing CSV with Pandas...' : uploadMode === 'overwrite' ? 'Replace Roster & Generate Fresh Tokens' : 'Sync Student Roster'}</span>
+                <span>{uploading ? 'Processing CSV with Pandas...' : uploadMode === 'overwrite' ? 'Replace Roster in MongoDB' : 'Sync Student Roster in MongoDB'}</span>
               </button>
             </form>
           </div>
@@ -939,12 +1032,68 @@ export default function AdminDashboard({ showToast }) {
             <select
               value={filterJoined}
               onChange={(e) => { setFilterJoined(e.target.value); setCurrentPage(1); }}
-              style={{ width: 160 }}
+              style={{ width: 150 }}
             >
               <option value="">Token: All</option>
               <option value="1">Redeemed / Joined</option>
               <option value="0">Active / Unused</option>
             </select>
+
+            {/* Filter by Academic Year */}
+            <select
+              value={filterYear}
+              onChange={(e) => { setFilterYear(e.target.value); setCurrentPage(1); }}
+              style={{ width: 130 }}
+            >
+              <option value="">Year: All</option>
+              <option value="1">1st Year</option>
+              <option value="2">2nd Year</option>
+              <option value="3">3rd Year</option>
+              <option value="4">4th Year</option>
+            </select>
+
+            {/* Filter by Goodies */}
+            <select
+              value={filterGoodies}
+              onChange={(e) => { setFilterGoodies(e.target.value); setCurrentPage(1); }}
+              style={{ width: 140 }}
+            >
+              <option value="">Goodies: All</option>
+              <option value="yes">Eligible (Yes)</option>
+              <option value="no">Not Eligible (No)</option>
+            </select>
+
+            {/* Filter by Branch */}
+            <select
+              value={filterBranch}
+              onChange={(e) => { setFilterBranch(e.target.value); setCurrentPage(1); }}
+              style={{ width: 140 }}
+            >
+              <option value="">Branch: All</option>
+              {availableBranches.map((b) => (
+                <option key={b} value={b}>{b}</option>
+              ))}
+            </select>
+
+            {/* Filter by Gender */}
+            <select
+              value={filterGender}
+              onChange={(e) => { setFilterGender(e.target.value); setCurrentPage(1); }}
+              style={{ width: 130 }}
+            >
+              <option value="">Gender: All</option>
+              <option value="Male">Male</option>
+              <option value="Female">Female</option>
+            </select>
+
+            <button
+              onClick={() => setSyncModalOpen(true)}
+              className="btn btn-primary btn-sm"
+              style={{ display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}
+            >
+              <RefreshCw size={14} />
+              <span>Sync ACM DB</span>
+            </button>
 
             <button
               onClick={() => {
@@ -957,6 +1106,7 @@ export default function AdminDashboard({ showToast }) {
                 }
               }}
               className="btn btn-danger btn-sm"
+              style={{ whiteSpace: 'nowrap' }}
             >
               <Trash2 size={14} />
               <span>Clear All</span>
@@ -1003,11 +1153,19 @@ export default function AdminDashboard({ showToast }) {
                         />
                       </td>
                       <td>{(currentPage - 1) * studentsData.limit + idx + 1}</td>
-                      <td><strong style={{ color: 'var(--heading)' }}>{s.name}</strong></td>
+                      <td>
+                        <strong style={{ color: 'var(--heading)' }}>{s.name}</strong>
+                        {s.email && <div style={{ fontSize: 11, color: 'var(--muted)' }}>{s.email}</div>}
+                      </td>
                       <td>{s.phone || '—'}</td>
                       <td>
                         <div>{s.acm_id || '—'}</div>
-                        <div style={{ fontSize: 11, color: 'var(--muted)' }}>{s.branch || ''}</div>
+                        <div style={{ fontSize: 11, color: 'var(--muted)', display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 2 }}>
+                          {s.branch && <span style={{ background: '#F1F5F9', color: '#334155', padding: '1px 5px', borderRadius: 4, fontWeight: 600 }}>{s.branch}</span>}
+                          {s.gender && <span style={{ background: '#FAF5FF', color: '#7E22CE', padding: '1px 5px', borderRadius: 4, fontWeight: 600 }}>{s.gender}</span>}
+                          {s.year && <span style={{ background: '#EFF6FF', color: '#1D4ED8', padding: '1px 5px', borderRadius: 4, fontWeight: 600 }}>{s.year}</span>}
+                          {s.goodies && <span style={{ background: String(s.goodies).toLowerCase().startsWith('y') ? '#ECFDF5' : '#F1F5F9', color: String(s.goodies).toLowerCase().startsWith('y') ? '#047857' : '#64748B', padding: '1px 5px', borderRadius: 4, fontWeight: 600 }}>Goodies: {s.goodies}</span>}
+                        </div>
                       </td>
                       <td>
                         <select
@@ -1626,6 +1784,124 @@ export default function AdminDashboard({ showToast }) {
               </button>
             </div>
           )}
+        </div>
+      </Modal>
+
+      {/* Live ACM DB Sync Modal */}
+      <Modal
+        isOpen={syncModalOpen}
+        onClose={() => !syncForm.loading && setSyncModalOpen(false)}
+        title="Sync from Live ACM MongoDB (registrations)"
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <p style={{ fontSize: 13, color: 'var(--muted)', margin: 0 }}>
+            Query your main cloud ACM MongoDB cluster (<code>ACE_REG.registrations</code>) and ingest student records directly into the dispatching portal.
+          </p>
+
+          <div>
+            <label style={{ fontSize: 13, fontWeight: 700, color: 'var(--heading)', display: 'block', marginBottom: 6 }}>
+              Target Academic Year:
+            </label>
+            <select
+              value={syncForm.year}
+              onChange={(e) => setSyncForm({ ...syncForm, year: e.target.value })}
+              style={{ width: '100%' }}
+            >
+              <option value="all">All Academic Years (Entire Roster)</option>
+              <option value="1st Year">1st Year Only (Freshers)</option>
+              <option value="2nd Year">2nd Year Only</option>
+              <option value="3rd Year">3rd Year Only</option>
+              <option value="4th Year">4th Year Only</option>
+            </select>
+          </div>
+
+          <div>
+            <label style={{ fontSize: 13, fontWeight: 700, color: 'var(--heading)', display: 'block', marginBottom: 6 }}>
+              Goodies Eligibility:
+            </label>
+            <select
+              value={syncForm.goodies}
+              onChange={(e) => setSyncForm({ ...syncForm, goodies: e.target.value })}
+              style={{ width: '100%' }}
+            >
+              <option value="all">All (Both Eligible &amp; Non-Eligible)</option>
+              <option value="yes">Goodies: Yes Only (Eligible)</option>
+              <option value="no">Goodies: No Only (Not Eligible)</option>
+            </select>
+          </div>
+
+          <div>
+            <label style={{ fontSize: 13, fontWeight: 700, color: 'var(--heading)', display: 'block', marginBottom: 6 }}>
+              Sync Mode:
+            </label>
+            <div className="radio-group" style={{ margin: 0 }}>
+              <label className={`radio-option ${syncForm.mode === 'sync' ? 'selected' : ''}`}>
+                <input
+                  type="radio"
+                  name="sync_mode"
+                  value="sync"
+                  checked={syncForm.mode === 'sync'}
+                  onChange={(e) => setSyncForm({ ...syncForm, mode: e.target.value })}
+                />
+                <div>
+                  <strong style={{ display: 'block', fontSize: 13, color: 'var(--heading)' }}>
+                    Sync &amp; Merge (Safe)
+                  </strong>
+                  <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                    Preserves current EBM assignments and contact statuses. Adds newly registered students.
+                  </span>
+                </div>
+              </label>
+
+              <label className={`radio-option ${syncForm.mode === 'overwrite' ? 'selected' : ''}`}>
+                <input
+                  type="radio"
+                  name="sync_mode"
+                  value="overwrite"
+                  checked={syncForm.mode === 'overwrite'}
+                  onChange={(e) => setSyncForm({ ...syncForm, mode: e.target.value })}
+                />
+                <div>
+                  <strong style={{ display: 'block', fontSize: 13, color: 'var(--heading)' }}>
+                    Clean Overwrite (Reset Portal)
+                  </strong>
+                  <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                    Cleans the portal student table and re-imports matching registrations from scratch.
+                  </span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, margin: 0 }}>
+            <input
+              type="checkbox"
+              checked={syncForm.generate_tokens}
+              onChange={(e) => setSyncForm({ ...syncForm, generate_tokens: e.target.checked })}
+            />
+            <span>Generate single-use WhatsApp join tokens for synced students</span>
+          </label>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 8 }}>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setSyncModalOpen(false)}
+              disabled={syncForm.loading}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={handleRunSyncDb}
+              disabled={syncForm.loading}
+              style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+            >
+              {syncForm.loading && <RefreshCw className="spin" size={14} />}
+              <span>{syncForm.loading ? 'Syncing...' : 'Run Sync Now'}</span>
+            </button>
+          </div>
         </div>
       </Modal>
     </div>
