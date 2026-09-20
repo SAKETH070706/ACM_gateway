@@ -82,7 +82,7 @@ export default function App() {
                 user?.role === 'admin' ? (
                   <AdminDashboard showToast={showToast} />
                 ) : (
-                  <Navigate to="/login" replace />
+                  <Navigate to="/login?admin=1" replace />
                 )
               }
             />

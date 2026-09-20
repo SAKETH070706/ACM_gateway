@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
 import {
   Users, UploadCloud, Split, MessageSquare, Settings,
@@ -444,6 +444,76 @@ export default function AdminDashboard({ showToast }) {
     } catch (err) {
       showToast(err.message, 'error');
     }
+  };
+
+  // --- Message Template Variable Insertion & Live Preview Helpers ---
+  const templateTextareaRef = useRef(null);
+
+  const insertVariableAtCursor = (variable) => {
+    const textarea = templateTextareaRef.current;
+    const currentContent = templateModal.data?.content || '';
+    if (!textarea) {
+      setTemplateModal((prev) => ({
+        ...prev,
+        data: { ...prev.data, content: currentContent + (currentContent ? ' ' : '') + variable }
+      }));
+      return;
+    }
+    const start = textarea.selectionStart ?? currentContent.length;
+    const end = textarea.selectionEnd ?? currentContent.length;
+    const newContent = currentContent.substring(0, start) + variable + currentContent.substring(end);
+    setTemplateModal((prev) => ({
+      ...prev,
+      data: { ...prev.data, content: newContent }
+    }));
+    setTimeout(() => {
+      textarea.focus();
+      const newPos = start + variable.length;
+      textarea.setSelectionRange(newPos, newPos);
+    }, 10);
+  };
+
+  const renderWhatsAppPreview = (rawContent) => {
+    if (!rawContent || !rawContent.trim()) {
+      return (
+        <div style={{ color: '#8696a0', fontStyle: 'italic', fontSize: 13, padding: '12px 0' }}>
+          Type your message on the left or click variable badges to see real-time preview...
+        </div>
+      );
+    }
+
+    // Substitute dynamic placeholders with realistic sample student details
+    let text = rawContent
+      .replace(/\{name\}/g, 'Y Maheswari Devi')
+      .replace(/\{acm_id\}/g, '26ACMA001')
+      .replace(/\{branch\}/g, 'IT')
+      .replace(/\{year\}/g, '1st Year')
+      .replace(/\{goodies\}/g, 'Yes (T-Shirt & Kit)')
+      .replace(/\{phone\}/g, '+91 98765 43210')
+      .replace(/\{link\}/g, 'http://localhost:5000/join/tk_sample_8f92');
+
+    // Escape HTML entities
+    const escapeHtml = (str) =>
+      str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    let safeText = escapeHtml(text);
+
+    // Format WhatsApp Markdown: *bold*, _italic_, ~strikethrough~, ```code```
+    safeText = safeText.replace(/\*([^*\n]+)\*/g, '<strong>$1</strong>');
+    safeText = safeText.replace(/_([^_\n]+)_/g, '<em>$1</em>');
+    safeText = safeText.replace(/~([^~\n]+)~/g, '<del>$1</del>');
+    safeText = safeText.replace(/```([^`]+)```/g, '<code style="background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 3px; font-family: monospace; font-size: 12px;">$1</code>');
+
+    // Highlight links
+    safeText = safeText.replace(
+      /(https?:\/\/[^\s<]+)/g,
+      '<span style="color: #027eb5; text-decoration: underline; word-break: break-all;">$1</span>'
+    );
+
+    // Preserve newlines
+    safeText = safeText.replace(/\n/g, '<br />');
+
+    return <div dangerouslySetInnerHTML={{ __html: safeText }} />;
   };
 
   // --- Actions: Template Save & Delete ---
@@ -1562,58 +1632,318 @@ export default function AdminDashboard({ showToast }) {
         </form>
       </Modal>
 
-      {/* Modal: Add/Edit Message Template */}
+      {/* Modal: Add/Edit Message Template with Real-Time WhatsApp Live Preview */}
       <Modal
         isOpen={templateModal.open}
+        maxWidth="980px"
         title={templateModal.isEdit ? 'Edit Message Template' : 'Create New Message Template'}
         onClose={() => setTemplateModal({ open: false, isEdit: false, data: {} })}
       >
         <form onSubmit={handleSaveTemplate}>
-          <div className="form-group">
-            <label>Template Title</label>
-            <input
-              type="text"
-              value={templateModal.data.title || ''}
-              onChange={(e) => setTemplateModal({ ...templateModal, data: { ...templateModal.data, title: e.target.value } })}
-              placeholder="e.g. Official WhatsApp Group Invitation"
-              required
-            />
-          </div>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))',
+            gap: 24,
+            alignItems: 'start'
+          }}>
+            {/* Left Side: Editor & Variable Chips */}
+            <div>
+              <div className="form-group" style={{ marginBottom: 16 }}>
+                <label style={{ fontSize: 13, fontWeight: 700, color: 'var(--heading)', marginBottom: 6, display: 'block' }}>
+                  Template Title
+                </label>
+                <input
+                  type="text"
+                  value={templateModal.data.title || ''}
+                  onChange={(e) => setTemplateModal({ ...templateModal, data: { ...templateModal.data, title: e.target.value } })}
+                  placeholder="e.g. Official WhatsApp Group Invitation"
+                  required
+                  style={{ width: '100%', padding: '9px 12px', fontSize: 14 }}
+                />
+              </div>
 
-          <div className="form-group">
-            <label>Message Content</label>
-            <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
-              {['{name}', '{link}', '{acm_id}', '{phone}', '{branch}'].map((ph) => (
-                <button
-                  key={ph}
-                  type="button"
-                  onClick={() => {
-                    const cur = templateModal.data.content || '';
-                    setTemplateModal({
-                      ...templateModal,
-                      data: { ...templateModal.data, content: cur + (cur ? ' ' : '') + ph }
-                    });
+              <div className="form-group" style={{ marginBottom: 16 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <label style={{ fontSize: 13, fontWeight: 700, color: 'var(--heading)', margin: 0 }}>
+                    Message Content
+                  </label>
+                  <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                    {(templateModal.data.content || '').length} characters
+                  </span>
+                </div>
+
+                {/* Variable Quick-Insert Chips */}
+                <div style={{
+                  background: 'var(--bg)',
+                  padding: '10px',
+                  borderRadius: 6,
+                  border: '1px solid var(--border)',
+                  marginBottom: 10
+                }}>
+                  <div style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: 'var(--muted)',
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.5px',
+                    marginBottom: 6
+                  }}>
+                    Click badge to insert variable at cursor:
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    {[
+                      { ph: '{name}', label: 'Name' },
+                      { ph: '{link}', label: 'Token Link' },
+                      { ph: '{acm_id}', label: 'ACM ID' },
+                      { ph: '{branch}', label: 'Branch' },
+                      { ph: '{year}', label: 'Year' },
+                      { ph: '{goodies}', label: 'Goodies' },
+                      { ph: '{phone}', label: 'Phone' }
+                    ].map((item) => (
+                      <button
+                        key={item.ph}
+                        type="button"
+                        onClick={() => insertVariableAtCursor(item.ph)}
+                        className="btn btn-secondary btn-sm"
+                        style={{
+                          fontSize: 11,
+                          padding: '4px 8px',
+                          borderRadius: 14,
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 4
+                        }}
+                        title={`Insert ${item.label}`}
+                      >
+                        <span style={{ color: 'var(--primary)', fontWeight: 700 }}>+</span>
+                        <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{item.ph}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <textarea
+                  ref={templateTextareaRef}
+                  rows="9"
+                  value={templateModal.data.content || ''}
+                  onChange={(e) => setTemplateModal({ ...templateModal, data: { ...templateModal.data, content: e.target.value } })}
+                  placeholder="Hello {name}, welcome to SRKR ACM Student Chapter! Here is your exclusive, single-use token to join our official WhatsApp community: {link}..."
+                  required
+                  style={{
+                    width: '100%',
+                    padding: '10px 12px',
+                    fontSize: 13,
+                    lineHeight: 1.5,
+                    fontFamily: 'inherit',
+                    resize: 'vertical'
                   }}
-                  className="btn btn-secondary btn-sm"
-                  style={{ fontSize: 11 }}
+                />
+
+                <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginTop: 6,
+                  fontSize: 11,
+                  color: 'var(--muted)'
+                }}>
+                  <span>WhatsApp formatting: <strong>*bold*</strong>, <em>_italic_</em>, <del>~strike~</del>, <code>```code```</code></span>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: 10, marginTop: 20 }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ flex: 1 }}
+                  onClick={() => setTemplateModal({ open: false, isEdit: false, data: {} })}
                 >
-                  +{ph}
+                  Cancel
                 </button>
-              ))}
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  style={{ flex: 1.5 }}
+                >
+                  {templateModal.isEdit ? 'Save Changes' : 'Create Template'}
+                </button>
+              </div>
             </div>
 
-            <textarea
-              rows="6"
-              value={templateModal.data.content || ''}
-              onChange={(e) => setTemplateModal({ ...templateModal, data: { ...templateModal.data, content: e.target.value } })}
-              placeholder="Hello {name}, here is your exclusive WhatsApp group link: {link}..."
-              required
-            />
-          </div>
+            {/* Right Side: WhatsApp Live Preview Phone Mockup */}
+            <div>
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 6
+              }}>
+                <label style={{ fontSize: 13, fontWeight: 700, color: 'var(--heading)', margin: 0 }}>
+                  Live WhatsApp Preview
+                </label>
+                <span style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  background: '#DCFCE7',
+                  color: '#15803D',
+                  padding: '2px 8px',
+                  borderRadius: 10
+                }}>
+                  REAL-TIME
+                </span>
+              </div>
 
-          <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: 8 }}>
-            {templateModal.isEdit ? 'Save Changes' : 'Create Template'}
-          </button>
+              {/* Phone Mockup Frame */}
+              <div style={{
+                borderRadius: 14,
+                overflow: 'hidden',
+                border: '1px solid #D1D5DB',
+                boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.1)',
+                background: '#ECE5DD'
+              }}>
+                {/* WhatsApp Chat Header */}
+                <div style={{
+                  background: '#075E54',
+                  padding: '10px 14px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  color: '#FFFFFF'
+                }}>
+                  <div style={{
+                    width: 36,
+                    height: 36,
+                    borderRadius: '50%',
+                    background: '#25D366',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontWeight: 700,
+                    fontSize: 14,
+                    color: '#FFFFFF'
+                  }}>
+                    MD
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, lineHeight: 1.2 }}>
+                      Y Maheswari Devi
+                    </div>
+                    <div style={{ fontSize: 11, opacity: 0.85 }}>
+                      online &bull; SRKR ACM Fresher
+                    </div>
+                  </div>
+                </div>
+
+                {/* WhatsApp Chat Body */}
+                <div style={{
+                  padding: '16px 12px',
+                  minHeight: 280,
+                  maxHeight: 380,
+                  overflowY: 'auto',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 10
+                }}>
+                  {/* Date Badge */}
+                  <div style={{
+                    alignSelf: 'center',
+                    background: 'rgba(255, 255, 255, 0.9)',
+                    padding: '3px 10px',
+                    borderRadius: 10,
+                    fontSize: 10,
+                    fontWeight: 600,
+                    color: '#54656F',
+                    boxShadow: '0 1px 1px rgba(0,0,0,0.08)',
+                    marginBottom: 4
+                  }}>
+                    TODAY
+                  </div>
+
+                  {/* Outgoing Message Bubble */}
+                  <div style={{
+                    alignSelf: 'flex-end',
+                    maxWidth: '92%',
+                    background: '#E7FFDB',
+                    color: '#111B21',
+                    borderRadius: '8px 0px 8px 8px',
+                    padding: '8px 12px 6px 12px',
+                    boxShadow: '0 1px 1px rgba(11,20,26,.13)',
+                    fontSize: 13,
+                    lineHeight: 1.45,
+                    wordBreak: 'break-word',
+                    position: 'relative'
+                  }}>
+                    {/* Rendered Text */}
+                    {renderWhatsAppPreview(templateModal.data.content)}
+
+                    {/* WhatsApp Rich Link Card Preview (if link tag exists) */}
+                    {(templateModal.data.content || '').includes('{link}') && (
+                      <div style={{
+                        marginTop: 8,
+                        borderRadius: 6,
+                        background: '#FFFFFF',
+                        border: '1px solid #D1D7DB',
+                        overflow: 'hidden',
+                        boxShadow: '0 1px 2px rgba(0,0,0,0.05)'
+                      }}>
+                        <div style={{
+                          background: 'linear-gradient(135deg, #128C7E 0%, #075E54 100%)',
+                          padding: '8px 10px',
+                          color: '#FFFFFF',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 8
+                        }}>
+                          <span style={{ fontSize: 16 }}>💬</span>
+                          <div>
+                            <div style={{ fontSize: 12, fontWeight: 700, lineHeight: 1.2 }}>
+                              ACE Fresher Community 2026
+                            </div>
+                            <div style={{ fontSize: 10, opacity: 0.85 }}>
+                              WhatsApp Group Invite &bull; Verified
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{ padding: '6px 10px', background: '#F8F9FA' }}>
+                          <div style={{ fontSize: 11, color: '#027eb5', fontWeight: 600 }}>
+                            chat.whatsapp.com/sample_tk_8f92
+                          </div>
+                          <div style={{ fontSize: 10, color: '#667781', marginTop: 1 }}>
+                            Click to join official WhatsApp group
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Message Time and Blue Double Checkmarks */}
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'flex-end',
+                      gap: 4,
+                      marginTop: 4,
+                      fontSize: 10,
+                      color: '#667781'
+                    }}>
+                      <span>10:42 AM</span>
+                      <span style={{ color: '#53BDEB', fontWeight: 700, letterSpacing: -1.5 }}>
+                        ✓✓
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{
+                fontSize: 11,
+                color: 'var(--muted)',
+                marginTop: 8,
+                textAlign: 'center'
+              }}>
+                ✨ Preview updates automatically with sample student details.
+              </div>
+            </div>
+          </div>
         </form>
       </Modal>
 
