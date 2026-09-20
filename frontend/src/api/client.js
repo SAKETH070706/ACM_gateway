@@ -23,11 +23,14 @@ function getResolvedBaseUrl() {
 export const API_BASE_URL = getResolvedBaseUrl();
 
 export async function apiRequest(endpoint, options = {}) {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('acm_auth_token') : null;
+
   const config = {
     credentials: 'include', // Crucial for cross-origin session cookies (Vercel <-> Render)
     ...options,
     headers: {
       'X-Requested-With': 'XMLHttpRequest',
+      ...(token ? { 'Authorization': `Bearer ${token}`, 'X-Admin-Token': token } : {}),
       ...(options.headers || {}),
     },
   };
@@ -54,10 +57,13 @@ export async function apiRequest(endpoint, options = {}) {
   }
 
   if (!response.ok) {
-    const errorMsg = data?.error || data?.message || response.statusText || 'An error occurred';
+    const errorMsg = data?.detail || data?.error || data?.message || response.statusText || 'An error occurred';
     const error = new Error(errorMsg);
     error.status = response.status;
     error.data = data;
+    if (response.status === 401 && typeof window !== 'undefined') {
+      localStorage.removeItem('acm_auth_token');
+    }
     throw error;
   }
 
@@ -66,12 +72,35 @@ export async function apiRequest(endpoint, options = {}) {
 
 export const api = {
   // Auth
-  loginAdmin: (password) => apiRequest('/api/auth/admin/login', { method: 'POST', body: { password } }),
-  loginEbm: (name, password) => apiRequest('/api/auth/ebm/login', { method: 'POST', body: { name, password } }),
+  loginAdmin: async (password) => {
+    const res = await apiRequest('/api/auth/admin/login', {
+      method: 'POST',
+      body: { password, key: password }
+    });
+    if (res && res.token && typeof window !== 'undefined') {
+      localStorage.setItem('acm_auth_token', res.token);
+    }
+    return res;
+  },
+  loginEbm: async (name, password) => {
+    const res = await apiRequest('/api/auth/ebm/login', {
+      method: 'POST',
+      body: { name, password }
+    });
+    if (res && res.token && typeof window !== 'undefined') {
+      localStorage.setItem('acm_auth_token', res.token);
+    }
+    return res;
+  },
   getEbmNames: () => apiRequest('/api/ebm/list-names'),
   registerEbm: (data) => apiRequest('/api/auth/ebm/register', { method: 'POST', body: data }),
   getMe: () => apiRequest('/api/auth/me'),
-  logout: () => apiRequest('/api/auth/logout', { method: 'POST' }),
+  logout: async () => {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('acm_auth_token');
+    }
+    return apiRequest('/api/auth/logout', { method: 'POST' });
+  },
 
   // Admin Overview & Settings
   getOverview: () => apiRequest('/api/admin/overview'),

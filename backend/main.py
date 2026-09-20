@@ -54,13 +54,13 @@ app = FastAPI(
 )
 
 # ----------------- SESSION MIDDLEWARE -----------------
-secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(24)
+secret_key = os.environ.get("FLASK_SECRET_KEY") or "ace_acm_portal_super_secret_session_key_2026_deterministic"
 app.add_middleware(
     SessionMiddleware,
     secret_key=secret_key,
     session_cookie="acm_session",
     max_age=86400 * 7,  # 7 days
-    same_site="lax",
+    same_site="none" if is_prod else "lax",
     https_only=is_prod
 )
 
