@@ -557,6 +557,127 @@ def api_get_filter_options():
         "genders": genders
     })
 
+# ----------------- EBM CSV UPLOAD (GOOGLE SHEET COMPATIBLE) -----------------
+@admin_bp.route("/api/admin/upload/ebm", methods=["POST"])
+@admin_required
+def api_upload_ebm():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    if not file or not file.filename.endswith(".csv"):
+        return jsonify({"error": "Please upload a valid .csv file"}), 400
+
+    try:
+        df = read_csv_dataframe(file)
+    except Exception as e:
+        return jsonify({"error": f"Failed to parse CSV: {str(e)}"}), 400
+
+    if df.empty:
+        return jsonify({"error": "Uploaded CSV file is empty"}), 400
+
+    # Flexible column matching for Google Sheets & standard templates
+    col_map = {}
+    for col in df.columns:
+        norm = col.strip().lower().replace("_", " ").replace("-", " ")
+        if norm in ["full name", "name", "ebm name", "candidate name"] and "name" not in col_map:
+            col_map["name"] = col
+        elif norm in ["password", "pass", "pwd", "secret"] and "password" not in col_map:
+            col_map["password"] = col
+        elif norm in ["confirmation number", "conf number", "conf no", "registration number", "id"] and "confirmation_number" not in col_map:
+            col_map["confirmation_number"] = col
+        elif any(k in norm for k in ["phone", "mobile", "whatsapp", "contact"]) and "phone" not in col_map:
+            col_map["phone"] = col
+        elif norm in ["weight", "quota", "capacity"] and "weight" not in col_map:
+            col_map["weight"] = col
+        elif norm in ["email", "email address"] and "email" not in col_map:
+            col_map["email"] = col
+        elif norm in ["branch", "dept", "department"] and "branch" not in col_map:
+            col_map["branch"] = col
+
+    if "name" not in col_map:
+        col_map["name"] = df.columns[0]
+
+    db = get_db()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    upserted_count = 0
+
+    for _, row in df.iterrows():
+        name_val = str(row[col_map["name"]]).strip() if pd.notna(row[col_map["name"]]) else ""
+        if not name_val:
+            continue
+
+        # Determine password: check 'password' column, fallback to 'confirmation_number', fallback to 'ebm123'
+        raw_pw = ""
+        if "password" in col_map and pd.notna(row[col_map["password"]]):
+            raw_pw = str(row[col_map["password"]]).strip()
+        elif "confirmation_number" in col_map and pd.notna(row[col_map["confirmation_number"]]):
+            raw_pw = str(row[col_map["confirmation_number"]]).strip()
+        if not raw_pw:
+            raw_pw = "ebm123"
+
+        # Determine weight: default leads to 6, others to 4, capped 1-20
+        default_weight = 6 if "lead" in name_val.lower() else 4
+        weight_val = default_weight
+        if "weight" in col_map and pd.notna(row[col_map["weight"]]):
+            try:
+                weight_val = min(20, max(1, int(row[col_map["weight"]])))
+            except Exception:
+                weight_val = default_weight
+
+        phone_val = clean_phone_number(row[col_map["phone"]]) if "phone" in col_map and pd.notna(row[col_map["phone"]]) else ""
+        email_val = str(row[col_map["email"]]).strip() if "email" in col_map and pd.notna(row[col_map["email"]]) else ""
+        branch_val = str(row[col_map["branch"]]).strip() if "branch" in col_map and pd.notna(row[col_map["branch"]]) else ""
+
+        # Extra data from remaining columns
+        extra_dict = {}
+        for c in df.columns:
+            if c not in col_map.values() and pd.notna(row[c]):
+                extra_dict[c] = str(row[c]).strip()
+
+        username_val = re.sub(r"[^a-zA-Z0-9_]", "", name_val.lower().replace(" ", "_"))
+        hashed_pw = generate_password_hash(raw_pw)
+
+        # Upsert by exact name or username
+        existing = db.ebms.find_one({
+            "$or": [
+                {"name": {"$regex": f"^{re.escape(name_val)}$", "$options": "i"}},
+                {"username": username_val}
+            ]
+        })
+
+        if existing:
+            update_data = {
+                "name": name_val,
+                "phone": phone_val or existing.get("phone", ""),
+                "weight": weight_val,
+                "email": email_val or existing.get("email", ""),
+                "branch": branch_val or existing.get("branch", ""),
+                "extra_data": extra_dict
+            }
+            # Only update password if explicit password was provided
+            if "password" in col_map or "confirmation_number" in col_map:
+                update_data["password"] = hashed_pw
+            db.ebms.update_one({"_id": existing["_id"]}, {"$set": update_data})
+        else:
+            db.ebms.insert_one({
+                "name": name_val,
+                "username": username_val,
+                "password": hashed_pw,
+                "phone": phone_val,
+                "email": email_val,
+                "branch": branch_val,
+                "weight": weight_val,
+                "role": "ebm",
+                "extra_data": extra_dict,
+                "created_at": now_str
+            })
+        upserted_count += 1
+
+    return jsonify({
+        "success": True,
+        "message": f"Successfully processed {upserted_count} EBM team members from CSV into MongoDB.",
+        "count": upserted_count
+    })
 
 # ----------------- EBM TEAM MANAGEMENT -----------------
 @admin_bp.route("/api/admin/ebm/list", methods=["GET"])

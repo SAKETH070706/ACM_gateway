@@ -1,0 +1,5 @@
+Timestamp,Email Address,Full Name,Phone Number(WhatsApp),Branch,Section,Gender,Date Of Birth,Domain,LinkedIn Profile URL (Optional),GitHub Profile URL (Optional),Instagram Profile URL (Optional),Confirmation Number,Password,Weight
+2026-09-20 10:00:00,ebm.lead1@gmail.com,EBM Lead One,9876543210,CSE,A,Male,2004-05-15,Web Development,https://linkedin.com/in/ebmlead1,https://github.com/ebmlead1,https://instagram.com/ebmlead1,CONF-1001,Pass@1234,6
+2026-09-20 10:05:00,ebm.member2@gmail.com,EBM Member Two,9876543211,IT,B,Female,2004-08-20,AI/ML,https://linkedin.com/in/ebmmember2,https://github.com/ebmmember2,,CONF-1002,Pass@1234,4
+2026-09-20 10:10:00,ebm.member3@gmail.com,EBM Member Three,9876543212,AIML,A,Male,2004-11-12,Design/Media,,,https://instagram.com/ebmmember3,CONF-1003,Pass@1234,4
+2026-09-20 10:15:00,ebm.coordinator4@gmail.com,EBM Coordinator Four,9876543213,ECE,C,Female,2003-02-18,Management,https://linkedin.com/in/ebmcoord4,,,CONF-1004,Pass@1234,5
