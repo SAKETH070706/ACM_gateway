@@ -781,6 +781,9 @@ def api_delete_ebm(ebm_id):
 def api_batch_split():
     data = request.get_json(silent=True) or {}
     reassign_all = bool(data.get("reassign_all", False))
+    target_year = str(data.get("year", "")).strip()
+    target_goodies = str(data.get("goodies", "")).strip()
+    target_branch = str(data.get("branch", "")).strip()
 
     db = get_db()
     ebms = list(db.ebms.find().sort([("weight", -1), ("name", 1)]))
@@ -788,21 +791,36 @@ def api_batch_split():
     if not ebms:
         return jsonify({"error": "No EBM members found. Please register or add EBMs first."}), 400
 
-    if reassign_all:
-        students = list(db.students.find().sort("_id", 1))
-    else:
-        students = list(db.students.find({
-            "$or": [{"assigned_ebm_id": None}, {"assigned_ebm_id": ""}]
-        }).sort("_id", 1))
+    query = {}
+    if not reassign_all:
+        query["$or"] = [{"assigned_ebm_id": None}, {"assigned_ebm_id": ""}]
+
+    if target_year and target_year.lower() not in ["all", "any"]:
+        query["year"] = {"$regex": f"^{re.escape(target_year)}", "$options": "i"}
+
+    if target_goodies and target_goodies.lower() not in ["all", "any"]:
+        if target_goodies.lower() in ["yes", "true", "eligible"]:
+            query["goodies"] = {"$in": ["Yes", "yes", "YES", True, 1]}
+        elif target_goodies.lower() in ["no", "false", "not eligible"]:
+            query["goodies"] = {"$in": ["No", "no", "NO", False, 0, None]}
+
+    if target_branch and target_branch.lower() not in ["all", "any"]:
+        query["branch"] = {"$regex": f"^{re.escape(target_branch)}$", "$options": "i"}
+
+    students = list(db.students.find(query).sort("_id", 1))
 
     if not students:
-        return jsonify({"message": "No unassigned students to split."}), 200
+        return jsonify({"message": "No matching students to split."}), 200
 
-    # Build weighted pool with weights capped 1-20
+    # Build fair interleaved weighted pool
+    weights_map = {str(e["_id"]): min(20, max(1, int(e.get("weight", 4)))) for e in ebms}
     weighted_pool = []
-    for e in ebms:
-        w = min(20, max(1, int(e.get("weight", 4))))
-        weighted_pool.extend([str(e["_id"])] * w)
+    remaining_weights = dict(weights_map)
+    while any(v > 0 for v in remaining_weights.values()):
+        for e_id in weights_map:
+            if remaining_weights[e_id] > 0:
+                weighted_pool.append(e_id)
+                remaining_weights[e_id] -= 1
 
     pool_len = len(weighted_pool)
 
@@ -813,13 +831,21 @@ def api_batch_split():
             "assigned_ebm_id": {"$nin": [None, ""]}
         })
 
+    bulk_ops = []
     for idx, s in enumerate(students):
         assigned_ebm_id = weighted_pool[(current_offset + idx) % pool_len]
-        db.students.update_one({"_id": s["_id"]}, {"$set": {"assigned_ebm_id": assigned_ebm_id}})
+        bulk_ops.append(UpdateOne({"_id": s["_id"]}, {"$set": {"assigned_ebm_id": assigned_ebm_id}}))
+
+    if bulk_ops:
+        try:
+            db.students.bulk_write(bulk_ops, ordered=False)
+        except TypeError:
+            for op in bulk_ops:
+                db.students.update_one(op._filter, op._doc)
 
     return jsonify({
         "success": True,
-        "message": f"Successfully distributed {len(students)} students across {len(ebms)} EBM members based on weights.",
+        "message": f"Successfully distributed all {len(students)} students across {len(ebms)} EBM members based on weights.",
         "distributed_count": len(students)
     })
 
