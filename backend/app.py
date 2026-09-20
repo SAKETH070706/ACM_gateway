@@ -35,10 +35,11 @@ app = Flask(__name__, template_folder=TEMPLATES_DIR, static_folder=None)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(24)
 
 # ----------------- CORS & CREDENTIAL CONFIGURATION -----------------
-# Default development origins: allows any port on localhost or 127.0.0.1 (5000, 5173, 3000, etc.)
+# Default development origins and safe Vercel pattern matching
 default_origins = [
     r"^https?://localhost(:\d+)?$",
     r"^https?://127\.0\.0\.1(:\d+)?$",
+    r"^https?://([a-zA-Z0-9-]+\.)*vercel\.app$",  # Automatically matches any Vercel deployment URL
     "http://localhost:5000",
     "http://127.0.0.1:5000",
     "http://localhost:5173",
