@@ -1,7 +1,7 @@
 import json
 import re
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Request, HTTPException, status
@@ -9,6 +9,36 @@ from backend.config import async_load_config, get_async_db
 from backend.routes.auth_api import require_ebm_or_admin
 
 ebm_router = APIRouter(tags=["EBM Operations"])
+
+# India Standard Time (IST) is UTC+5:30
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now() -> datetime:
+    return datetime.now(IST)
+
+def get_ist_now_str(dt: datetime = None) -> str:
+    if dt is None:
+        dt = get_ist_now()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def format_ist_display(val) -> str:
+    if not val:
+        return ""
+    if isinstance(val, str):
+        if "IST" in val:
+            return val
+        try:
+            dt = datetime.strptime(val, "%Y-%m-%d %H:%M:%S")
+            return dt.strftime("%d %b %Y, %I:%M %p IST")
+        except Exception:
+            return val
+    elif isinstance(val, datetime):
+        if val.tzinfo is None:
+            val = val.replace(tzinfo=IST)
+        else:
+            val = val.astimezone(IST)
+        return val.strftime("%d %b %Y, %I:%M %p IST")
+    return str(val)
 
 def safe_object_id(id_val):
     if id_val is None:
@@ -77,11 +107,13 @@ def format_message(template_str, student_dict, base_url):
 
 @ebm_router.get("/api/ebm/dashboard")
 async def api_ebm_dashboard(request: Request, username: str = None, ebm_id: str = None):
-    require_ebm_or_admin(request)
+    user = require_ebm_or_admin(request)
     db = get_async_db()
     ebm_info = None
 
-    if request.session.get("admin_authenticated") and (username or ebm_id):
+    is_admin = user.get("role") == "admin" or bool(request.session.get("admin_authenticated"))
+
+    if is_admin and (username or ebm_id):
         if ebm_id:
             oid = safe_object_id(ebm_id)
             ebm_info = await db.ebms.find_one({"$or": [{"_id": oid}, {"id": ebm_id}]})
@@ -92,10 +124,21 @@ async def api_ebm_dashboard(request: Request, username: str = None, ebm_id: str 
                     {"name": {"$regex": f"^{re.escape(username)}$", "$options": "i"}}
                 ]
             })
-    elif request.session.get("ebm_user"):
-        session_id = request.session["ebm_user"]["id"]
-        oid = safe_object_id(session_id)
-        ebm_info = await db.ebms.find_one({"$or": [{"_id": oid}, {"id": session_id}]})
+    else:
+        # Resolve via authenticated user
+        user_id = user.get("id") or user.get("_id")
+        if user_id:
+            oid = safe_object_id(user_id)
+            ebm_info = await db.ebms.find_one({"$or": [{"_id": oid}, {"id": str(user_id)}]})
+        if not ebm_info:
+            target_name = username or user.get("username") or user.get("name")
+            if target_name:
+                ebm_info = await db.ebms.find_one({
+                    "$or": [
+                        {"username": target_name.lower()},
+                        {"name": {"$regex": f"^{re.escape(target_name)}$", "$options": "i"}}
+                    ]
+                })
 
     if not ebm_info:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="EBM profile not found")
@@ -135,10 +178,11 @@ async def api_ebm_dashboard(request: Request, username: str = None, ebm_id: str 
 
         tok = s.get("token")
         inv = inv_map.get(tok, {}) if tok else {}
-        is_used = bool(inv.get("is_used", 0))
+        is_used = bool(s.get("is_used") == 1 or inv.get("is_used", 0) == 1)
         if is_used:
             joined_count += 1
 
+        raw_used = s.get("used_at") or inv.get("used_at") or ""
         link = f"{base_url}/join/{tok}" if tok else ""
         d = {
             "id": s_id,
@@ -152,10 +196,10 @@ async def api_ebm_dashboard(request: Request, username: str = None, ebm_id: str 
             "token": tok or "",
             "full_invite_link": link,
             "is_contacted": 1 if is_contacted else 0,
-            "contacted_at": s.get("contacted_at", ""),
-            "created_at": s.get("created_at", ""),
+            "contacted_at": format_ist_display(s.get("contacted_at", "")),
+            "created_at": format_ist_display(s.get("created_at", "")),
             "is_used": 1 if is_used else 0,
-            "used_at": inv.get("used_at", "")
+            "used_at": format_ist_display(raw_used) or raw_used
         }
 
         formatted_text = format_message(tpl_content, d, base_url)
@@ -197,8 +241,8 @@ async def api_ebm_dashboard(request: Request, username: str = None, ebm_id: str 
 
 @ebm_router.post("/api/ebm/students/{student_id}/toggle-contact")
 async def api_toggle_student_contact(request: Request, student_id: str):
-    require_ebm_or_admin(request)
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    user = require_ebm_or_admin(request)
+    now_str = get_ist_now_str()
     db = get_async_db()
     oid = safe_object_id(student_id)
 
@@ -206,13 +250,21 @@ async def api_toggle_student_contact(request: Request, student_id: str):
     if not student:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 
-    if not request.session.get("admin_authenticated"):
-        ebm_user = request.session.get("ebm_user")
-        if not ebm_user or str(ebm_user["id"]) != str(student.get("assigned_ebm_id")):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Forbidden: You are not assigned to this student"
-            )
+    is_admin = user.get("role") == "admin" or bool(request.session.get("admin_authenticated"))
+    if not is_admin:
+        user_id = str(user.get("id") or user.get("_id") or "")
+        assigned_id = str(student.get("assigned_ebm_id") or "")
+        if user_id != assigned_id:
+            ebm_doc = await db.ebms.find_one({"_id": safe_object_id(assigned_id)})
+            user_un = (user.get("username") or "").lower()
+            ebm_un = (ebm_doc.get("username") if ebm_doc else "").lower()
+            user_nm = (user.get("name") or "").lower()
+            ebm_nm = (ebm_doc.get("name") if ebm_doc else "").lower()
+            if not ebm_doc or (ebm_un != user_un and ebm_nm != user_nm):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden: You are not assigned to this student"
+                )
 
     current_status = student.get("is_contacted", 0)
     new_status = 0 if current_status else 1

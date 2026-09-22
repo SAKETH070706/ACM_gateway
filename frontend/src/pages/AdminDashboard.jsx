@@ -1673,7 +1673,7 @@ export default function AdminDashboard({ showToast }) {
               type="text"
               value={ebmModal.data.name || ''}
               onChange={(e) => setEbmModal({ ...ebmModal, data: { ...ebmModal.data, name: e.target.value } })}
-              placeholder="e.g. EBM Lead One"
+              placeholder="e.g. EBM Coordinator One"
               required
             />
           </div>
@@ -1684,7 +1684,7 @@ export default function AdminDashboard({ showToast }) {
               type="text"
               value={ebmModal.data.username || ''}
               onChange={(e) => setEbmModal({ ...ebmModal, data: { ...ebmModal.data, username: e.target.value.toLowerCase() } })}
-              placeholder="e.g. ebm_lead_1"
+              placeholder="e.g. ebm_coord_1"
               disabled={ebmModal.isEdit}
               required
             />

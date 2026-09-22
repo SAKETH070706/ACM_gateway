@@ -1,20 +1,84 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Link Expired</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
-    body { background-color: #0c1317; color: #e9edef; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
-    .card { background: #111b21; border-radius: 16px; padding: 36px 28px; max-width: 440px; width: 100%; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.4); border: 1px solid #3b282c; }
-    .icon { width: 64px; height: 64px; background: #ea4335; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px; color: white; font-size: 32px; font-weight: bold; }
-    h1 { font-size: 22px; margin-bottom: 12px; color: #f28b82; }
-    p { font-size: 14px; color: #8696a0; line-height: 1.5; margin-bottom: 20px; }
-    .notice-box { background: #1a2228; border: 1px dashed #42525a; border-radius: 8px; padding: 14px; font-size: 13px; color: #aebac1; margin-bottom: 20px; text-align: left; }
-    .meta { font-size: 12px; color: #667781; }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    body {
+      background-color: #0c1317;
+      color: #e9edef;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .card {
+      background: #111b21;
+      border-radius: 16px;
+      padding: 36px 28px;
+      max-width: 440px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      border: 1px solid #3b282c;
+    }
+
+    .icon {
+      width: 64px;
+      height: 64px;
+      background: #ea4335;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 20px;
+      color: white;
+      font-size: 32px;
+      font-weight: bold;
+    }
+
+    h1 {
+      font-size: 22px;
+      margin-bottom: 12px;
+      color: #f28b82;
+    }
+
+    p {
+      font-size: 14px;
+      color: #8696a0;
+      line-height: 1.5;
+      margin-bottom: 20px;
+    }
+
+    .notice-box {
+      background: #1a2228;
+      border: 1px dashed #42525a;
+      border-radius: 8px;
+      padding: 14px;
+      font-size: 13px;
+      color: #aebac1;
+      margin-bottom: 20px;
+      text-align: left;
+    }
+
+    .meta {
+      font-size: 12px;
+      color: #667781;
+    }
   </style>
 </head>
+
 <body>
   <div class="card">
     <div class="icon">&times;</div>
@@ -22,11 +86,13 @@
     <p>This WhatsApp invitation link was set to single-use only and has already been redeemed.</p>
     <div class="notice-box">
       <strong>Why am I seeing this?</strong><br>
-      To prevent spam and unauthorized sharing, each recipient receives a personal one-time link. Forwarded or duplicate clicks are automatically rejected.
+      To prevent spam and unauthorized sharing, each recipient receives a personal one-time link. Forwarded or duplicate
+      clicks are automatically rejected.
     </div>
     {% if used_at %}
     <div class="meta">Redeemed on: {{ used_at }}</div>
     {% endif %}
   </div>
 </body>
+
 </html>

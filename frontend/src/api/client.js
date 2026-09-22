@@ -27,6 +27,7 @@ export async function apiRequest(endpoint, options = {}) {
 
   const config = {
     credentials: 'include', // Crucial for cross-origin session cookies (Vercel <-> Render)
+    keepalive: options.keepalive !== undefined ? options.keepalive : (options.method === 'POST' && (!options.body || (typeof options.body === 'string' && options.body.length < 60000))),
     ...options,
     headers: {
       'X-Requested-With': 'XMLHttpRequest',

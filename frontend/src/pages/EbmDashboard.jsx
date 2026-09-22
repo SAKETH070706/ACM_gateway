@@ -34,6 +34,39 @@ export default function EbmDashboard({ user, showToast }) {
   };
 
   const handleToggleContact = async (studentId) => {
+    // 1. Optimistic UI update immediately (0ms delay)
+    let previousState = null;
+    setData((prev) => {
+      if (!prev) return prev;
+      previousState = prev;
+      const target = prev.students.find((s) => s.id === studentId);
+      const newStatus = target && target.is_contacted ? 0 : 1;
+      const updatedStudents = prev.students.map((s) => {
+        if (s.id === studentId) {
+          return {
+            ...s,
+            is_contacted: newStatus
+          };
+        }
+        return s;
+      });
+
+      const contactedCount = updatedStudents.filter((s) => s.is_contacted).length;
+      const total = updatedStudents.length;
+
+      return {
+        ...prev,
+        students: updatedStudents,
+        stats: {
+          ...prev.stats,
+          contacted: contactedCount,
+          pending: total - contactedCount,
+          progress_percent: total ? Math.round((contactedCount / total) * 100) : 0
+        }
+      };
+    });
+
+    // 2. Persist to server
     try {
       const res = await api.toggleContact(studentId);
       setData((prev) => {
@@ -65,7 +98,9 @@ export default function EbmDashboard({ user, showToast }) {
       });
       showToast(res.is_contacted ? 'Marked as contacted' : 'Unmarked contact status');
     } catch (err) {
-      showToast(err.message, 'error');
+      // Revert if error
+      if (previousState) setData(previousState);
+      showToast(err.message || 'Failed to update contact status', 'error');
     }
   };
 

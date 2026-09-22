@@ -71,20 +71,27 @@ async def api_admin_overview(request: Request):
     (
         total_students,
         contacted_students,
-        total_invites,
-        used_invites,
         unassigned_students,
         ebm_docs,
         templates_count
     ) = await asyncio.gather(
         db.students.count_documents({}),
         db.students.count_documents({"is_contacted": 1}),
-        db.invites.count_documents({}),
-        db.invites.count_documents({"is_used": 1}),
         db.students.count_documents({"$or": [{"assigned_ebm_id": None}, {"assigned_ebm_id": ""}]}),
         db.ebms.find({}, {"_id": 1, "name": 1, "username": 1, "weight": 1}).sort([("weight", -1), ("name", 1)]).to_list(length=1000),
         db.message_templates.count_documents({})
     )
+
+    # Active student tokens
+    student_tokens = [t for t in await db.students.distinct("token") if t]
+    total_invites = len(student_tokens) if student_tokens else total_students
+
+    # Used invites belonging to active students
+    used_inv_docs = await db.invites.find({"token": {"$in": student_tokens}, "is_used": 1}, {"token": 1}).to_list(100000)
+    used_tokens = set(inv["token"] for inv in used_inv_docs if inv.get("token"))
+    st_joined_tokens = set(await db.students.distinct("token", {"is_used": 1}))
+    all_joined_tokens = used_tokens.union(st_joined_tokens)
+    joined_whatsapp = len(all_joined_tokens)
 
     # Fast aggregate breakdown by EBM
     student_stats = await db.students.aggregate([
@@ -92,21 +99,24 @@ async def api_admin_overview(request: Request):
             "$group": {
                 "_id": "$assigned_ebm_id",
                 "total_assigned": {"$sum": 1},
-                "contacted": {"$sum": {"$cond": [{"$eq": ["$is_contacted", 1]}, 1, 0]}}
+                "contacted": {"$sum": {"$cond": [{"$eq": ["$is_contacted", 1]}, 1, 0]}},
+                "joined": {"$sum": {"$cond": [{"$eq": ["$is_used", 1]}, 1, 0]}}
             }
         }
     ]).to_list(1000)
     stats_map = {str(item["_id"]): item for item in student_stats if item["_id"]}
 
-    used_inv_docs = await db.invites.find({"is_used": 1}, {"token": 1}).to_list(100000)
-    used_tokens = [inv["token"] for inv in used_inv_docs if inv.get("token")]
-    joined_map = {}
-    if used_tokens:
+    # Fallback to token matching to ensure 100% precision
+    if all_joined_tokens:
         joined_agg = await db.students.aggregate([
-            {"$match": {"token": {"$in": used_tokens}}},
+            {"$match": {"token": {"$in": list(all_joined_tokens)}}},
             {"$group": {"_id": "$assigned_ebm_id", "joined_count": {"$sum": 1}}}
         ]).to_list(1000)
-        joined_map = {str(item["_id"]): item["joined_count"] for item in joined_agg if item["_id"]}
+        for item in joined_agg:
+            if item["_id"]:
+                ebm_k = str(item["_id"])
+                if ebm_k in stats_map:
+                    stats_map[ebm_k]["joined"] = max(stats_map[ebm_k].get("joined", 0), item["joined_count"])
 
     ebm_breakdown = []
     for doc in ebm_docs:
@@ -114,7 +124,7 @@ async def api_admin_overview(request: Request):
         item_stat = stats_map.get(ebm_id_str, {})
         total_assigned = item_stat.get("total_assigned", 0)
         contacted = item_stat.get("contacted", 0)
-        joined = joined_map.get(ebm_id_str, 0)
+        joined = item_stat.get("joined", 0)
         pending = total_assigned - contacted
         progress = round((contacted / total_assigned * 100) if total_assigned > 0 else 0, 1)
 
@@ -135,14 +145,20 @@ async def api_admin_overview(request: Request):
             "progress_percent": progress
         })
 
+    contact_rate = round((contacted_students / total_students * 100) if total_students > 0 else 0, 1)
+    join_rate = round((joined_whatsapp / total_students * 100) if total_students > 0 else 0, 1)
+
     return {
         "stats": {
             "total_students": total_students,
             "contacted_students": contacted_students,
+            "contact_rate": contact_rate,
             "pending_students": total_students - contacted_students,
             "total_invites": total_invites,
-            "used_invites": used_invites,
-            "pending_invites": total_invites - used_invites,
+            "used_invites": joined_whatsapp,
+            "joined_whatsapp": joined_whatsapp,
+            "join_rate": join_rate,
+            "pending_invites": total_invites - joined_whatsapp,
             "unassigned_students": unassigned_students,
             "total_ebms": len(ebm_docs),
             "total_templates": templates_count
@@ -573,7 +589,12 @@ async def api_assign_single_student(request: Request, student_id: str):
 
 # ----------------- CSV UPLOAD & SYNC -----------------
 @admin_router.post("/api/admin/upload/students")
-async def api_upload_students_csv(request: Request, file: UploadFile = File(...)):
+async def api_upload_students_csv(
+    request: Request,
+    file: UploadFile = File(...),
+    mode: str = Form("sync"),
+    generate_tokens: bool = Form(True)
+):
     require_admin(request)
     contents = await file.read()
     try:
@@ -598,10 +619,15 @@ async def api_upload_students_csv(request: Request, file: UploadFile = File(...)
             col_map["goodies"] = col
 
     db = get_async_db()
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = get_ist_now_str()
 
-    student_docs = []
-    invite_docs = []
+    if mode == "overwrite":
+        await db.students.delete_many({})
+        await db.invites.delete_many({})
+
+    student_ops = []
+    invite_ops = []
+    processed_count = 0
 
     for _, row in df.iterrows():
         name_val = str(row[col_map["name"]]).strip() if "name" in col_map and pd.notna(row[col_map["name"]]) else "Fresher"
@@ -612,31 +638,65 @@ async def api_upload_students_csv(request: Request, file: UploadFile = File(...)
         goodies_val = str(row[col_map["goodies"]]).strip() if "goodies" in col_map and pd.notna(row[col_map["goodies"]]) else "Yes"
 
         tok = secrets.token_urlsafe(12)
-        student_docs.append({
-            "name": name_val,
-            "phone": phone_val,
-            "acm_id": acm_id_val,
-            "branch": branch_val,
-            "year": year_val,
-            "goodies": goodies_val,
-            "token": tok,
-            "assigned_ebm_id": "",
-            "is_contacted": 0,
-            "created_at": now_str
-        })
-        invite_docs.append({
-            "token": tok,
-            "is_used": 0,
-            "created_at": now_str
-        })
 
-    if student_docs:
-        await db.students.insert_many(student_docs)
-        await db.invites.insert_many(invite_docs)
+        # Smart duplicate match: match by ACM ID if provided, otherwise match by (Name + Branch) OR by Phone
+        if acm_id_val:
+            match_query = {"acm_id": acm_id_val}
+        elif branch_val:
+            match_query = {
+                "$or": [
+                    {"name": {"$regex": f"^{re.escape(name_val)}$", "$options": "i"}, "branch": {"$regex": f"^{re.escape(branch_val)}$", "$options": "i"}},
+                    {"phone": phone_val}
+                ]
+            }
+        else:
+            match_query = {
+                "$or": [
+                    {"name": {"$regex": f"^{re.escape(name_val)}$", "$options": "i"}},
+                    {"phone": phone_val}
+                ]
+            }
+
+        student_ops.append(
+            UpdateOne(
+                match_query,
+                {
+                    "$set": {
+                        "name": name_val,
+                        "phone": phone_val,
+                        "acm_id": acm_id_val,
+                        "branch": branch_val,
+                        "year": year_val,
+                        "goodies": goodies_val
+                    },
+                    "$setOnInsert": {
+                        "token": tok,
+                        "assigned_ebm_id": "",
+                        "is_contacted": 0,
+                        "created_at": now_str
+                    }
+                },
+                upsert=True
+            )
+        )
+        if generate_tokens:
+            invite_ops.append(
+                UpdateOne(
+                    {"token": tok},
+                    {"$setOnInsert": {"token": tok, "is_used": 0, "created_at": now_str}},
+                    upsert=True
+                )
+            )
+        processed_count += 1
+
+    if student_ops:
+        await db.students.bulk_write(student_ops, ordered=False)
+        if invite_ops:
+            await db.invites.bulk_write(invite_ops, ordered=False)
 
     return {
         "success": True,
-        "message": f"Successfully imported {len(student_docs)} students."
+        "message": f"Successfully processed {processed_count} students ({mode} mode)."
     }
 
 @admin_router.post("/api/admin/upload/ebm")
@@ -760,33 +820,55 @@ async def api_admin_sync_registrations(request: Request):
         goodies = r.get("goodies") or "Yes"
 
         tok = secrets.token_urlsafe(12)
-        match_query = {"acm_id": acm_id} if acm_id else {"phone": phone}
+
+        # Smart match: by ACM ID if present, otherwise by Name+Branch OR Phone
+        if acm_id:
+            match_query = {"acm_id": acm_id}
+        elif branch:
+            match_query = {
+                "$or": [
+                    {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}, "branch": {"$regex": f"^{re.escape(branch)}$", "$options": "i"}},
+                    {"phone": phone}
+                ]
+            }
+        else:
+            match_query = {
+                "$or": [
+                    {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}},
+                    {"phone": phone}
+                ]
+            }
 
         student_ops.append(
             UpdateOne(
                 match_query,
-                {"$setOnInsert": {
-                    "name": name,
-                    "phone": phone,
-                    "acm_id": acm_id,
-                    "branch": branch,
-                    "year": year,
-                    "goodies": goodies,
-                    "token": tok,
-                    "assigned_ebm_id": "",
-                    "is_contacted": 0,
-                    "created_at": now_str
-                }},
+                {
+                    "$set": {
+                        "name": name,
+                        "phone": phone,
+                        "acm_id": acm_id,
+                        "branch": branch,
+                        "year": year,
+                        "goodies": goodies
+                    },
+                    "$setOnInsert": {
+                        "token": tok,
+                        "assigned_ebm_id": "",
+                        "is_contacted": 0,
+                        "created_at": now_str
+                    }
+                },
                 upsert=True
             )
         )
-        invite_ops.append(
-            UpdateOne(
-                {"token": tok},
-                {"$setOnInsert": {"token": tok, "is_used": 0, "created_at": now_str}},
-                upsert=True
+        if generate_tokens:
+            invite_ops.append(
+                UpdateOne(
+                    {"token": tok},
+                    {"$setOnInsert": {"token": tok, "is_used": 0, "created_at": now_str}},
+                    upsert=True
+                )
             )
-        )
         synced_count += 1
 
     if student_ops:
