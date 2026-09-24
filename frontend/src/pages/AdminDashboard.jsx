@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
 import {
   Users, UploadCloud, Split, MessageSquare, Settings,
-  RefreshCw, Download, Trash2, Plus, Check, Search,
+  RefreshCw, Download, Trash2, Plus, Check, Circle, Search,
   ExternalLink, Copy, Shield, AlertTriangle, ArrowRight, Layers,
   ArrowRightLeft, Edit2
 } from 'lucide-react';
@@ -468,6 +468,37 @@ export default function AdminDashboard({ showToast }) {
         )
       }));
       showToast(err.message || 'Failed to update status', 'error');
+    }
+  };
+
+  const handleToggleStudentJoin = async (studentId, currentUsed) => {
+    const newUsed = currentUsed ? 0 : 1;
+    // Optimistic UI update (0ms latency)
+    setStudentsData((prev) => ({
+      ...prev,
+      students: prev.students.map((s) =>
+        s.id === studentId ? { ...s, is_used: newUsed } : s
+      )
+    }));
+    try {
+      const res = await api.adminToggleJoin(studentId);
+      setStudentsData((prev) => ({
+        ...prev,
+        students: prev.students.map((s) =>
+          s.id === studentId ? { ...s, is_used: res.is_used, used_at: res.used_at } : s
+        )
+      }));
+      showToast(res.message || (newUsed ? 'Student marked as Joined WhatsApp Group' : 'Student reset to Pending Join (Link re-enabled)'));
+      loadInitialData(); // Refresh summary metrics
+    } catch (err) {
+      // Revert optimistic update on failure
+      setStudentsData((prev) => ({
+        ...prev,
+        students: prev.students.map((s) =>
+          s.id === studentId ? { ...s, is_used: currentUsed } : s
+        )
+      }));
+      showToast(err.message || 'Failed to update join status', 'error');
     }
   };
 
@@ -1328,16 +1359,40 @@ export default function AdminDashboard({ showToast }) {
                         </select>
                       </td>
                       <td>
-                        {s.is_used ? (
-                          <div>
-                            <span className="badge badge-danger">Redeemed</span>
-                            <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
-                              {s.used_at || ''}
-                            </div>
+                        <button
+                          type="button"
+                          onClick={() => handleToggleStudentJoin(s.id, s.is_used)}
+                          className={`badge ${s.is_used ? 'badge-danger' : 'badge-success'}`}
+                          style={{
+                            cursor: 'pointer',
+                            border: s.is_used ? '1px solid #DC2626' : '1px solid #16A34A',
+                            padding: '4px 8px',
+                            fontSize: 11,
+                            fontWeight: 600,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 4,
+                            transition: 'all 0.15s ease'
+                          }}
+                          title={s.is_used ? "Click to reset token / undo to Pending Join (re-enables link)" : "Click to mark as Joined / Redeemed"}
+                        >
+                          {s.is_used ? (
+                            <>
+                              <Check size={12} strokeWidth={2.5} />
+                              <span>Redeemed (Joined)</span>
+                            </>
+                          ) : (
+                            <>
+                              <Circle size={10} strokeWidth={2.5} />
+                              <span>Active (Pending)</span>
+                            </>
+                          )}
+                        </button>
+                        {s.is_used && s.used_at ? (
+                          <div style={{ fontSize: 10, color: 'var(--muted)', marginTop: 2 }}>
+                            {s.used_at}
                           </div>
-                        ) : (
-                          <span className="badge badge-success">Active Token</span>
-                        )}
+                        ) : null}
                       </td>
                       <td>
                         <button

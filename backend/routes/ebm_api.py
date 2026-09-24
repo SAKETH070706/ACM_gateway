@@ -280,3 +280,75 @@ async def api_toggle_student_contact(request: Request, student_id: str):
         "is_contacted": new_status,
         "contacted_at": contacted_at
     }
+
+@ebm_router.post("/api/ebm/students/{student_id}/toggle-join")
+async def api_toggle_student_join(request: Request, student_id: str):
+    user = require_ebm_or_admin(request)
+    now_str = get_ist_now_str()
+    db = get_async_db()
+    oid = safe_object_id(student_id)
+
+    student = await db.students.find_one({"$or": [{"_id": oid}, {"id": student_id}]})
+    if not student:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+    is_admin = user.get("role") == "admin" or bool(request.session.get("admin_authenticated"))
+    if not is_admin:
+        user_id = str(user.get("id") or user.get("_id") or "")
+        assigned_id = str(student.get("assigned_ebm_id") or "")
+        if user_id != assigned_id:
+            ebm_doc = await db.ebms.find_one({"_id": safe_object_id(assigned_id)})
+            user_un = (user.get("username") or "").lower()
+            ebm_un = (ebm_doc.get("username") if ebm_doc else "").lower()
+            user_nm = (user.get("name") or "").lower()
+            ebm_nm = (ebm_doc.get("name") if ebm_doc else "").lower()
+            if not ebm_doc or (ebm_un != user_un and ebm_nm != user_nm):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden: You are not assigned to this student"
+                )
+
+    # Determine current joined state
+    token = student.get("token")
+    inv = await db.invites.find_one({"token": token}) if token else None
+    current_joined = bool(student.get("is_used") == 1 or (inv and inv.get("is_used") == 1))
+    new_status = 0 if current_joined else 1
+    used_at = now_str if new_status == 1 else None
+
+    # Ensure token exists
+    if not token:
+        token = secrets.token_urlsafe(12)
+        await db.students.update_one({"_id": student["_id"]}, {"$set": {"token": token}})
+
+    # Update student record
+    await db.students.update_one(
+        {"_id": student["_id"]},
+        {"$set": {"is_used": new_status, "used_at": used_at}}
+    )
+
+    # Synchronize invite record
+    invite_update = {"is_used": new_status, "used_at": used_at}
+    if new_status == 0:
+        invite_update["ip_address"] = None
+        invite_update["device_id"] = None
+
+    await db.invites.update_one(
+        {"token": token},
+        {
+            "$set": invite_update,
+            "$setOnInsert": {
+                "token": token,
+                "assigned_to": student.get("name", "Student"),
+                "student_id": str(student["_id"]),
+                "created_at": now_str
+            }
+        },
+        upsert=True
+    )
+
+    return {
+        "success": True,
+        "is_used": new_status,
+        "used_at": format_ist_display(used_at) if used_at else "",
+        "message": "Student marked as Joined WhatsApp Group" if new_status == 1 else "Student reset to Pending Join (Invite link re-enabled)"
+    }

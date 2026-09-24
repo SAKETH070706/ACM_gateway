@@ -104,6 +104,70 @@ export default function EbmDashboard({ user, showToast }) {
     }
   };
 
+  const handleToggleJoin = async (studentId) => {
+    // 1. Optimistic UI update immediately (0ms delay)
+    let previousState = null;
+    setData((prev) => {
+      if (!prev) return prev;
+      previousState = prev;
+      const target = prev.students.find((s) => s.id === studentId);
+      const newStatus = target && target.is_used ? 0 : 1;
+      const updatedStudents = prev.students.map((s) => {
+        if (s.id === studentId) {
+          return {
+            ...s,
+            is_used: newStatus
+          };
+        }
+        return s;
+      });
+
+      const joinedCount = updatedStudents.filter((s) => s.is_used).length;
+
+      return {
+        ...prev,
+        students: updatedStudents,
+        stats: {
+          ...prev.stats,
+          joined_whatsapp: joinedCount
+        }
+      };
+    });
+
+    // 2. Persist to server
+    try {
+      const res = await api.toggleJoin(studentId);
+      setData((prev) => {
+        if (!prev) return prev;
+        const updatedStudents = prev.students.map((s) => {
+          if (s.id === studentId) {
+            return {
+              ...s,
+              is_used: res.is_used,
+              used_at: res.used_at
+            };
+          }
+          return s;
+        });
+
+        const joinedCount = updatedStudents.filter((s) => s.is_used).length;
+
+        return {
+          ...prev,
+          students: updatedStudents,
+          stats: {
+            ...prev.stats,
+            joined_whatsapp: joinedCount
+          }
+        };
+      });
+      showToast(res.message || (res.is_used ? 'Marked as Joined WhatsApp Group' : 'Reset to Pending Join'));
+    } catch (err) {
+      if (previousState) setData(previousState);
+      showToast(err.message || 'Failed to update join status', 'error');
+    }
+  };
+
   const copyMessage = (text, studentName) => {
     if (navigator.clipboard) {
       navigator.clipboard.writeText(text);
@@ -419,15 +483,35 @@ export default function EbmDashboard({ user, showToast }) {
                     </td>
 
                     <td>
-                      {s.is_used ? (
-                        <span className="badge badge-success">
-                          &#10003; Joined Group
-                        </span>
-                      ) : (
-                        <span className="badge badge-warning">
-                          Pending Join
-                        </span>
-                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleToggleJoin(s.id)}
+                        className={`badge ${s.is_used ? 'badge-success' : 'badge-warning'}`}
+                        style={{
+                          cursor: 'pointer',
+                          border: s.is_used ? '1px solid #16A34A' : '1px solid #D97706',
+                          padding: '5px 10px',
+                          fontSize: 12,
+                          fontWeight: 600,
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 5,
+                          transition: 'all 0.15s ease'
+                        }}
+                        title={s.is_used ? "Click to undo -> Reset to Pending Join (re-enables link)" : "Click to manually mark as Joined Group (marks link redeemed)"}
+                      >
+                        {s.is_used ? (
+                          <>
+                            <Check size={13} strokeWidth={2.5} />
+                            <span>Joined Group</span>
+                          </>
+                        ) : (
+                          <>
+                            <Circle size={11} strokeWidth={2.5} color="#D97706" />
+                            <span>Pending Join</span>
+                          </>
+                        )}
+                      </button>
                     </td>
                   </tr>
                 );

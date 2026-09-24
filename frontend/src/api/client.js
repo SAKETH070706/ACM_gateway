@@ -27,6 +27,7 @@ export async function apiRequest(endpoint, options = {}) {
 
   const config = {
     credentials: 'include', // Crucial for cross-origin session cookies (Vercel <-> Render)
+    cache: 'no-store', // Always fetch fresh live data from database, never use stale browser cache
     keepalive: options.keepalive !== undefined ? options.keepalive : (options.method === 'POST' && (!options.body || (typeof options.body === 'string' && options.body.length < 60000))),
     ...options,
     headers: {
@@ -133,6 +134,7 @@ export const api = {
   syncRegistrations: (payload = {}) => apiRequest('/api/admin/sync/registrations', { method: 'POST', body: payload }),
   updateStudent: (studentId, studentData) => apiRequest(`/api/admin/students/${studentId}`, { method: 'PUT', body: studentData }),
   updateStudentStatus: (studentId, statusData) => apiRequest(`/api/admin/students/${studentId}/status`, { method: 'PATCH', body: statusData }),
+  adminToggleJoin: (studentId) => apiRequest(`/api/admin/students/${studentId}/toggle-join`, { method: 'POST' }),
   renewToken: (studentId, action = 'reset') => apiRequest(`/api/admin/tokens/renew/${studentId}`, { method: 'POST', body: { action } }),
   deleteStudent: (studentId) => apiRequest(`/api/admin/students/${studentId}`, { method: 'DELETE' }),
   clearAllStudents: () => apiRequest('/api/admin/students/clear-all', { method: 'POST' }),
@@ -150,4 +152,5 @@ export const api = {
     return apiRequest(`/api/ebm/dashboard?${query}`);
   },
   toggleContact: (studentId) => apiRequest(`/api/ebm/students/${studentId}/toggle-contact`, { method: 'POST' }),
+  toggleJoin: (studentId) => apiRequest(`/api/ebm/students/${studentId}/toggle-join`, { method: 'POST' }),
 };

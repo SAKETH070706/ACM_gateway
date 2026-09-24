@@ -15,6 +15,7 @@ from werkzeug.security import generate_password_hash
 
 from backend.config import async_load_config, async_save_config, get_async_db
 from backend.routes.auth_api import require_admin
+from backend.routes.ebm_api import get_ist_now_str, format_ist_display
 
 admin_router = APIRouter(tags=["Admin Operations"])
 
@@ -398,6 +399,19 @@ async def api_admin_update_student_status(request: Request, student_id: str):
             update_fields["is_contacted"] = 0
             update_fields["contacted_at"] = None
 
+    if "is_used" in data:
+        used_val = int(bool(data["is_used"]))
+        used_at = now_str if used_val == 1 else None
+        update_fields["is_used"] = used_val
+        update_fields["used_at"] = used_at
+        token = student.get("token")
+        if token:
+            inv_upd = {"is_used": used_val, "used_at": used_at}
+            if used_val == 0:
+                inv_upd["ip_address"] = None
+                inv_upd["device_id"] = None
+            await db.invites.update_one({"token": token}, {"$set": inv_upd})
+
     if "assigned_ebm_id" in data:
         update_fields["assigned_ebm_id"] = data["assigned_ebm_id"] or ""
 
@@ -408,7 +422,61 @@ async def api_admin_update_student_status(request: Request, student_id: str):
         "success": True,
         "message": "Student status updated",
         "is_contacted": update_fields.get("is_contacted", student.get("is_contacted", 0)),
-        "contacted_at": update_fields.get("contacted_at", student.get("contacted_at"))
+        "contacted_at": update_fields.get("contacted_at", student.get("contacted_at")),
+        "is_used": update_fields.get("is_used", student.get("is_used", 0)),
+        "used_at": update_fields.get("used_at", student.get("used_at"))
+    }
+
+@admin_router.post("/api/admin/students/{student_id}/toggle-join")
+async def api_admin_toggle_student_join(request: Request, student_id: str):
+    require_admin(request)
+    now_str = get_ist_now_str()
+    db = get_async_db()
+    oid = safe_object_id(student_id)
+
+    student = await db.students.find_one({"$or": [{"_id": oid}, {"id": student_id}]})
+    if not student:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+    token = student.get("token")
+    inv = await db.invites.find_one({"token": token}) if token else None
+    current_joined = bool(student.get("is_used") == 1 or (inv and inv.get("is_used") == 1))
+    new_status = 0 if current_joined else 1
+    used_at = now_str if new_status == 1 else None
+
+    if not token:
+        token = secrets.token_urlsafe(12)
+        await db.students.update_one({"_id": student["_id"]}, {"$set": {"token": token}})
+
+    await db.students.update_one(
+        {"_id": student["_id"]},
+        {"$set": {"is_used": new_status, "used_at": used_at}}
+    )
+
+    invite_update = {"is_used": new_status, "used_at": used_at}
+    if new_status == 0:
+        invite_update["ip_address"] = None
+        invite_update["device_id"] = None
+
+    await db.invites.update_one(
+        {"token": token},
+        {
+            "$set": invite_update,
+            "$setOnInsert": {
+                "token": token,
+                "assigned_to": student.get("name", "Student"),
+                "student_id": str(student["_id"]),
+                "created_at": now_str
+            }
+        },
+        upsert=True
+    )
+
+    return {
+        "success": True,
+        "is_used": new_status,
+        "used_at": format_ist_display(used_at) if used_at else "",
+        "message": "Student marked as Joined WhatsApp Group" if new_status == 1 else "Student reset to Pending Join (Invite link re-enabled)"
     }
 
 @admin_router.delete("/api/admin/students/{student_id}")
@@ -784,102 +852,214 @@ async def api_upload_ebm_csv(request: Request, file: UploadFile = File(...)):
 async def api_admin_sync_registrations(request: Request):
     require_admin(request)
     data = await request.json()
-    year_filter = data.get("year", "all")
-    goodies_filter = data.get("goodies", "all")
-    mode = data.get("mode", "sync")
+    year_filter = str(data.get("year", "all")).strip()
+    goodies_filter = str(data.get("goodies", "all")).strip()
+    raw_gen = data.get("generate_tokens")
+    generate_tokens = True if raw_gen is None or str(raw_gen).lower() in ["true", "1", "yes"] else False
+    mode = str(data.get("mode", "sync")).strip().lower()
 
     db = get_async_db()
     query = {}
-    if year_filter != "all":
+    if year_filter and year_filter.lower() not in ["all", "any"]:
         query["year"] = {"$regex": f"^{re.escape(year_filter)}", "$options": "i"}
-    if goodies_filter != "all":
-        if goodies_filter.lower() == "yes":
-            query["goodies"] = {"$regex": "^yes", "$options": "i"}
-        elif goodies_filter.lower() == "no":
-            query["goodies"] = {"$regex": "^no", "$options": "i"}
+    if goodies_filter and goodies_filter.lower() not in ["all", "any"]:
+        if goodies_filter.lower() in ["yes", "true", "eligible"]:
+            query["goodies"] = {"$in": ["Yes", "yes", "YES", True]}
+        elif goodies_filter.lower() in ["no", "false", "not eligible"]:
+            query["goodies"] = {"$in": ["No", "no", "NO", False, None]}
 
-    regs_cursor = db.registrations.find(query)
-    regs = await regs_cursor.to_list(length=50000)
+    regs = await db.registrations.find(query).to_list(length=50000)
+    if not regs:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No registrations found in database matching specified criteria."
+        )
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if mode == "overwrite":
         await db.students.delete_many({})
         await db.invites.delete_many({})
+        students_to_insert = []
+        invites_to_insert = []
 
-    student_ops = []
-    invite_ops = []
-    synced_count = 0
-
-    for r in regs:
-        acm_id = r.get("acm_id") or ""
-        phone = clean_phone_number(r.get("phone"))
-        name = r.get("name") or "Student"
-        branch = r.get("branch") or ""
-        year = r.get("year") or "1"
-        goodies = r.get("goodies") or "Yes"
-
-        tok = secrets.token_urlsafe(12)
-
-        # Smart match: by ACM ID if present, otherwise by Name+Branch OR Phone
-        if acm_id:
-            match_query = {"acm_id": acm_id}
-        elif branch:
-            match_query = {
-                "$or": [
-                    {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}, "branch": {"$regex": f"^{re.escape(branch)}$", "$options": "i"}},
-                    {"phone": phone}
-                ]
-            }
-        else:
-            match_query = {
-                "$or": [
-                    {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}},
-                    {"phone": phone}
-                ]
-            }
-
-        student_ops.append(
-            UpdateOne(
-                match_query,
-                {
-                    "$set": {
-                        "name": name,
-                        "phone": phone,
-                        "acm_id": acm_id,
-                        "branch": branch,
-                        "year": year,
-                        "goodies": goodies
-                    },
-                    "$setOnInsert": {
-                        "token": tok,
-                        "assigned_ebm_id": "",
-                        "is_contacted": 0,
-                        "created_at": now_str
-                    }
+        for r in regs:
+            token = secrets.token_urlsafe(12) if generate_tokens else None
+            ace_id = (r.get("aceId") or r.get("acm_id") or "").strip()
+            phone = clean_phone_number(r.get("phone"))
+            reg_id = str(r["_id"])
+            s_doc = {
+                "name": r.get("name") or "Student",
+                "phone": phone,
+                "email": r.get("email", ""),
+                "acm_id": ace_id,
+                "branch": r.get("branch", ""),
+                "year": r.get("year", "1st Year"),
+                "goodies": r.get("goodies", "Yes"),
+                "gender": r.get("gender", ""),
+                "registration_id": reg_id,
+                "extra_data": {
+                    "email": r.get("email", ""),
+                    "gender": r.get("gender", ""),
+                    "mode": r.get("mode", ""),
+                    "registrationType": r.get("registrationType", ""),
+                    "payment": r.get("payment", "")
                 },
-                upsert=True
-            )
-        )
-        if generate_tokens:
-            invite_ops.append(
-                UpdateOne(
-                    {"token": tok},
-                    {"$setOnInsert": {"token": tok, "is_used": 0, "created_at": now_str}},
-                    upsert=True
-                )
-            )
-        synced_count += 1
+                "assigned_ebm_id": None,
+                "token": token,
+                "is_contacted": 0,
+                "contacted_at": None,
+                "created_at": now_str
+            }
+            students_to_insert.append(s_doc)
+            if token:
+                invites_to_insert.append({
+                    "token": token,
+                    "assigned_to": r.get("name") or "Student",
+                    "student_id": None,
+                    "is_used": 0,
+                    "used_at": None,
+                    "ip_address": None,
+                    "device_id": None,
+                    "created_at": now_str
+                })
 
-    if student_ops:
-        await db.students.bulk_write(student_ops, ordered=False)
-        await db.invites.bulk_write(invite_ops, ordered=False)
+        if students_to_insert:
+            res = await db.students.insert_many(students_to_insert)
+            if generate_tokens and invites_to_insert:
+                for inv, s_id in zip(invites_to_insert, res.inserted_ids):
+                    inv["student_id"] = str(s_id)
+                await db.invites.insert_many(invites_to_insert)
 
-    return {
-        "success": True,
-        "message": f"Synced {synced_count} records successfully.",
-        "count": synced_count
-    }
+        return {
+            "success": True,
+            "message": f"Successfully imported {len(students_to_insert)} student(s) directly from ACE_REG registrations (Overwrite Mode).",
+            "imported_count": len(students_to_insert),
+            "tokens_generated": generate_tokens
+        }
+
+    else:
+        # Sync mode: High-performance bulk upsert preserving existing tokens and EBM assignments
+        existing_students = await db.students.find({}, {
+            "_id": 1, "registration_id": 1, "acm_id": 1, "phone": 1, "token": 1, "name": 1, "branch": 1
+        }).to_list(length=50000)
+
+        existing_by_reg = {str(s["registration_id"]): s for s in existing_students if s.get("registration_id")}
+        existing_by_acm = {str(s["acm_id"]).strip().upper(): s for s in existing_students if s.get("acm_id")}
+        existing_by_phone = {str(s["phone"]).strip(): s for s in existing_students if s.get("phone")}
+        existing_by_name_branch = {
+            (str(s.get("name", "")).strip().lower(), str(s.get("branch", "")).strip().lower()): s
+            for s in existing_students if s.get("name")
+        }
+
+        students_to_insert = []
+        invites_for_new = []
+        update_operations = []
+        invites_for_updated = []
+
+        for r in regs:
+            ace_id = (r.get("aceId") or r.get("acm_id") or "").strip()
+            phone = clean_phone_number(r.get("phone"))
+            reg_id = str(r["_id"])
+            name = (r.get("name") or "Student").strip()
+            branch = (r.get("branch") or "").strip()
+            year = r.get("year", "1st Year")
+            goodies = r.get("goodies", "Yes")
+
+            existing = (
+                existing_by_reg.get(reg_id) or
+                (existing_by_acm.get(ace_id.upper()) if ace_id else None) or
+                (existing_by_phone.get(phone) if phone else None) or
+                (existing_by_name_branch.get((name.lower(), branch.lower())) if name and branch else None)
+            )
+
+            if existing:
+                update_fields = {
+                    "name": name,
+                    "email": r.get("email", ""),
+                    "phone": phone,
+                    "acm_id": ace_id,
+                    "branch": branch,
+                    "year": year,
+                    "goodies": goodies,
+                    "gender": r.get("gender", ""),
+                    "registration_id": reg_id
+                }
+                if generate_tokens and not existing.get("token"):
+                    new_tok = secrets.token_urlsafe(12)
+                    update_fields["token"] = new_tok
+                    existing["token"] = new_tok
+                    invites_for_updated.append({
+                        "token": new_tok,
+                        "assigned_to": name,
+                        "student_id": str(existing["_id"]),
+                        "is_used": 0,
+                        "used_at": None,
+                        "ip_address": None,
+                        "device_id": None,
+                        "created_at": now_str
+                    })
+                update_operations.append(UpdateOne({"_id": existing["_id"]}, {"$set": update_fields}))
+            else:
+                new_tok = secrets.token_urlsafe(12) if generate_tokens else None
+                s_doc = {
+                    "name": name,
+                    "phone": phone,
+                    "email": r.get("email", ""),
+                    "acm_id": ace_id,
+                    "branch": branch,
+                    "year": year,
+                    "goodies": goodies,
+                    "gender": r.get("gender", ""),
+                    "registration_id": reg_id,
+                    "extra_data": {
+                        "email": r.get("email", ""),
+                        "gender": r.get("gender", ""),
+                        "mode": r.get("mode", ""),
+                        "registrationType": r.get("registrationType", ""),
+                        "payment": r.get("payment", "")
+                    },
+                    "assigned_ebm_id": None,
+                    "token": new_tok,
+                    "is_contacted": 0,
+                    "contacted_at": None,
+                    "created_at": now_str
+                }
+                students_to_insert.append(s_doc)
+                if new_tok:
+                    invites_for_new.append({
+                        "token": new_tok,
+                        "assigned_to": name,
+                        "student_id": None,
+                        "is_used": 0,
+                        "used_at": None,
+                        "ip_address": None,
+                        "device_id": None,
+                        "created_at": now_str
+                    })
+
+        updated_count = len(update_operations)
+        inserted_count = len(students_to_insert)
+
+        if update_operations:
+            await db.students.bulk_write(update_operations, ordered=False)
+        if invites_for_updated:
+            await db.invites.insert_many(invites_for_updated)
+
+        if students_to_insert:
+            res = await db.students.insert_many(students_to_insert)
+            if generate_tokens and invites_for_new:
+                for inv, s_id in zip(invites_for_new, res.inserted_ids):
+                    inv["student_id"] = str(s_id)
+                await db.invites.insert_many(invites_for_new)
+
+        return {
+            "success": True,
+            "message": f"Sync from ACE_REG complete: {inserted_count} new student(s) added, {updated_count} updated.",
+            "inserted_count": inserted_count,
+            "updated_count": updated_count,
+            "tokens_generated": generate_tokens
+        }
 
 @admin_router.get("/api/admin/filter-options")
 async def api_admin_filter_options(request: Request):
